@@ -13,28 +13,39 @@
 // limitations under the License.
 
 #include "google/cloud/odbc/bq_driver/odbc_sql_results.h"
+#include "google/cloud/odbc/bq_driver/internal/odbc_type_utils.h"
 #include "google/cloud/odbc/bq_driver/odbc_commons.h"
 #include "google/cloud/odbc/bq_driver/odbc_descriptor.h"
 #include "google/cloud/odbc/bq_driver/odbc_diagnostics.h"
 #include "google/cloud/odbc/bq_driver/odbc_statement.h"
 #include "google/cloud/odbc/testing/bq_driver_utils/handles.h"
+#include "google/cloud/odbc/testing/bq_driver_utils/utils.h"
 #include "google/cloud/odbc/testing/utils/status_matchers.h"
 #include <gtest/gtest.h>
 
 namespace google::cloud::odbc_bq_driver {
 
+using google::cloud::odbc_bq_driver_internal::BQDataType;
+using google::cloud::odbc_bq_driver_internal::ColumnSchema;
 using google::cloud::odbc_bq_driver_internal::ConnectionHandle;
 using google::cloud::odbc_bq_driver_internal::DescriptorHandle;
 using google::cloud::odbc_bq_driver_internal::DescriptorRecord;
 using google::cloud::odbc_bq_driver_internal::DescriptorType;
+using google::cloud::odbc_bq_driver_internal::DSValue;
+using google::cloud::odbc_bq_driver_internal::EncodeWideToWire;
 using google::cloud::odbc_bq_driver_internal::StatementHandle;
 using google::cloud::odbc_bq_driver_internal::StmtStates;
+using google::cloud::odbc_bq_driver_internal::Utf8ToUtf16;
+using google::cloud::odbc_bq_driver_internal::WireEncoding;
+using google::cloud::odbc_bq_driver_internal::WireWcharSize;
 using google::cloud::odbc_internal::SQLStates;
+using google::cloud::odbc_testing_bq_driver_utils::CanaryBuffer;
 using google::cloud::odbc_testing_bq_driver_utils::CreateConnectionHandle;
 using google::cloud::odbc_testing_bq_driver_utils::
     CreateDescRecordWithRandomValues;
 using google::cloud::odbc_testing_bq_driver_utils::CreateStatementHandle;
 using google::cloud::odbc_testing_bq_driver_utils::CreateStmtHandleWithState;
+using google::cloud::odbc_testing_bq_driver_utils::ScopedWireEncoding;
 using ::testing::HasSubstr;
 
 inline SQLUSMALLINT GetDescCount(SQLPOINTER ard) {
@@ -669,4 +680,132 @@ TEST(SQLGetData, InvalidTargetType) {
   EXPECT_EQ(SQLStates::k_HY003(),
             handle.GetDiagnostics().GetStatusRecords()[0].sql_state);
 }
+namespace {
+
+// A prepared statement positioned on a single row with one STRING column.
+StatementHandle CreateStringResultHandle(std::string const& value) {
+  StatementHandle handle = CreateStatementHandle();
+  handle.SetStmtState(StmtStates::kStatementPrepared);
+  auto& result_set = handle.GetResultSet();
+  result_set.row_schema = {ColumnSchema{0, BQDataType::kString}};
+  result_set.rows = {{DSValue(value.begin(), value.end())}};
+  result_set.cursor = 0;
+  return handle;
+}
+
+// Reads column 1 as SQL_C_WCHAR in chunks of `buffer_units` code units, each
+// into a fresh guarded buffer, and returns the concatenated wire bytes.
+std::string ReadWcharInChunks(StatementHandle& handle,
+                              std::size_t buffer_units) {
+  std::size_t const wire_sz = WireWcharSize();
+  std::string collected;
+  for (int call = 0; call < 100; ++call) {
+    CanaryBuffer chunk(buffer_units * wire_sz);
+    SQLLEN indicator = 0;
+    SQLRETURN rc =
+        SQLGetDataInternal(&handle, 1, SQL_C_WCHAR, chunk.data(),
+                           static_cast<SQLLEN>(chunk.size()), &indicator);
+    EXPECT_TRUE(chunk.CanariesIntact()) << "call " << call;
+    EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "call " << call;
+    // Every chunk is NUL-terminated within the buffer.
+    std::size_t units = 0;
+    while (units < buffer_units && !chunk.IsNulAt(units, wire_sz)) ++units;
+    EXPECT_LT(units, buffer_units) << "call " << call;
+    collected.append(reinterpret_cast<char const*>(chunk.bytes()),
+                     units * wire_sz);
+    if (rc != SQL_SUCCESS_WITH_INFO) break;
+  }
+  return collected;
+}
+
+class SQLGetDataWcharTest : public ::testing::TestWithParam<WireEncoding> {
+ protected:
+  SQLGetDataWcharTest() : encoding_(GetParam()) {}
+
+  static std::string Wire(std::string const& utf8) {
+    auto wide = Utf8ToUtf16(utf8);
+    return wide ? EncodeWideToWire(*wide) : std::string();
+  }
+
+  ScopedWireEncoding encoding_;
+};
+
+TEST_P(SQLGetDataWcharTest, FitsInOneCall) {
+  std::string const value = "Hello";
+  StatementHandle handle = CreateStringResultHandle(value);
+  std::size_t const wire_sz = WireWcharSize();
+  CanaryBuffer dest(16 * wire_sz);
+  SQLLEN indicator = 0;
+
+  EXPECT_EQ(SQL_SUCCESS,
+            SQLGetDataInternal(&handle, 1, SQL_C_WCHAR, dest.data(),
+                               static_cast<SQLLEN>(dest.size()), &indicator));
+  EXPECT_TRUE(dest.CanariesIntact());
+  EXPECT_EQ(indicator, value.size() * wire_sz);
+  EXPECT_TRUE(dest.IsNulAt(value.size(), wire_sz));
+}
+
+TEST_P(SQLGetDataWcharTest, PartialDataStaysInBoundsAndReassembles) {
+  std::string const value = "Hello, wide world! 0123456789";
+  for (std::size_t units : {2, 3, 8, 29}) {
+    SCOPED_TRACE("buffer_units=" + std::to_string(units));
+    StatementHandle handle = CreateStringResultHandle(value);
+    EXPECT_EQ(ReadWcharInChunks(handle, units), Wire(value));
+  }
+}
+
+TEST_P(SQLGetDataWcharTest, PartialNonAsciiDataReassembles) {
+  // 東京 😀 abc: multi-byte in UTF-8 and a surrogate pair in UTF-16.
+  std::string const value = "\xE6\x9D\xB1\xE4\xBA\xAC \xF0\x9F\x98\x80 abc";
+  for (std::size_t units : {2, 3, 4, 7}) {
+    SCOPED_TRACE("buffer_units=" + std::to_string(units));
+    StatementHandle handle = CreateStringResultHandle(value);
+    EXPECT_EQ(ReadWcharInChunks(handle, units), Wire(value));
+  }
+}
+
+TEST_P(SQLGetDataWcharTest, BufferSmallerThanOneCodeUnit) {
+  std::size_t const wire_sz = WireWcharSize();
+  if (wire_sz == 1) GTEST_SKIP() << "No buffer is smaller than one byte";
+  StatementHandle handle = CreateStringResultHandle("Hello, world");
+  CanaryBuffer dest(wire_sz - 1);
+  SQLLEN indicator = 0;
+
+  EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+            SQLGetDataInternal(&handle, 1, SQL_C_WCHAR, dest.data(),
+                               static_cast<SQLLEN>(dest.size()), &indicator));
+  EXPECT_TRUE(dest.CanariesIntact());
+}
+
+INSTANTIATE_TEST_SUITE_P(WireEncodings, SQLGetDataWcharTest,
+                         ::testing::Values(WireEncoding::kUtf8,
+                                           WireEncoding::kUtf16Le,
+                                           WireEncoding::kUtf32Le));
+
+TEST(SQLGetDataWchar, MultiByteUtf8ThatFitsAsUtf16IsReturned) {
+  // 8 UTF-8 bytes but only 4 UTF-16 code units: more bytes than the buffer
+  // holds code units, yet the wire form and its NUL fit in one call.
+  ScopedWireEncoding encoding(WireEncoding::kUtf16Le);
+  std::string const value = "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9";  // éééé
+  StatementHandle handle = CreateStringResultHandle(value);
+  std::size_t const wire_sz = WireWcharSize();
+  CanaryBuffer dest(5 * wire_sz);
+  SQLLEN indicator = 0;
+
+  EXPECT_EQ(SQL_SUCCESS,
+            SQLGetDataInternal(&handle, 1, SQL_C_WCHAR, dest.data(),
+                               static_cast<SQLLEN>(dest.size()), &indicator));
+  EXPECT_TRUE(dest.CanariesIntact());
+  auto wide = Utf8ToUtf16(value);
+  ASSERT_TRUE(wide.Ok());
+  std::string const expected = EncodeWideToWire(*wide);
+  EXPECT_EQ(
+      std::string(reinterpret_cast<char const*>(dest.bytes()), expected.size()),
+      expected);
+  EXPECT_TRUE(dest.IsNulAt(4, wire_sz));
+  EXPECT_EQ(indicator, expected.size());
+}
+
+}  // namespace
+
 }  // namespace google::cloud::odbc_bq_driver

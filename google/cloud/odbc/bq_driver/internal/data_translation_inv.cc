@@ -62,6 +62,12 @@ StatusRecordOr<std::string> ConvertFromCharBuffer(DataBuffer& src_data,
       if ((result_len > 0) || (result_len == SQL_NTS)) {
         if (result_len > 0) {
           result_len /= WireWcharSize();
+          // Less than one code unit: an empty string. Passing 0 on would be
+          // read as SQL_NTS.
+          if (result_len == 0) {
+            src_str = "";
+            break;
+          }
         }
         auto utf8_res = BqConvertSQLWCHARToString(
             wchar_buf, static_cast<SQLINTEGER>(result_len));

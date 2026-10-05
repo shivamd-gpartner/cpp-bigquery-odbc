@@ -15,6 +15,8 @@
 #include "google/cloud/odbc/bq_driver/internal/trace_utils.h"
 #include "absl/log/internal/globals.h"
 #include "absl/strings/str_format.h"
+#include <atomic>
+#include <optional>
 #include <sstream>
 
 namespace google::cloud::odbc_bq_driver_internal {
@@ -28,6 +30,56 @@ constexpr int kKB = 1024;
 constexpr int kCharBufSize2 = 256;
 
 static std::once_flag absl_log_init_flag;
+
+namespace {
+// The ini is read before absl logging is initialized (and before stderr output
+// is suppressed), so messages about the wire encoding are queued here and
+// written by LogPendingWcharEncoding() once logging is up.
+std::mutex wchar_encoding_mu;
+std::optional<WcharEncodingConfig> last_wchar_encoding_config;
+std::optional<WcharEncodingConfig> pending_wchar_encoding_log;
+std::atomic<bool> has_pending_wchar_encoding_log{false};
+
+bool SameWcharEncodingConfig(WcharEncodingConfig const& a,
+                             WcharEncodingConfig const& b) {
+  return a.encoding == b.encoding && a.warnings == b.warnings &&
+         a.errors == b.errors;
+}
+
+void LogPendingWcharEncoding() {
+  if (!has_pending_wchar_encoding_log.load(std::memory_order_acquire)) return;
+  std::optional<WcharEncodingConfig> config;
+  {
+    std::lock_guard<std::mutex> lk(wchar_encoding_mu);
+    config.swap(pending_wchar_encoding_log);
+    has_pending_wchar_encoding_log.store(false, std::memory_order_release);
+  }
+  if (!config) return;
+  for (auto const& warning : config->warnings) {
+    LOG(WARNING) << "WcharEncoding:: " << warning;
+  }
+  for (auto const& error : config->errors) {
+    LOG(ERROR) << "WcharEncoding:: " << error;
+  }
+  LOG(INFO) << "WcharEncoding:: SQLWCHAR wire encoding is "
+            << WireEncodingName(GetEffectiveWireEncoding()) << " ("
+            << WireWcharSize() << " byte(s) per code unit), configured as '"
+            << WireEncodingName(config->encoding) << "'";
+}
+}  // namespace
+
+void ApplyWcharEncodingConfig(Section const& driver_section) {
+  WcharEncodingConfig config = ResolveWcharEncoding(driver_section);
+  SetWireEncoding(config.encoding);
+  std::lock_guard<std::mutex> lk(wchar_encoding_mu);
+  if (last_wchar_encoding_config &&
+      SameWcharEncodingConfig(*last_wchar_encoding_config, config)) {
+    return;
+  }
+  last_wchar_encoding_config = config;
+  pending_wchar_encoding_log = std::move(config);
+  has_pending_wchar_encoding_log.store(true, std::memory_order_release);
+}
 // Initialize the Singleton instance.
 std::shared_ptr<TraceOptions> TraceOptions::options_file_ = nullptr;
 std::mutex TraceOptions::mu_;
@@ -241,6 +293,7 @@ bool TraceOptions::InitializeLogging(bool is_trace_override) {
 
   // Logging already initialized and no override requested
   if (trace_opts->logging_enabled && !is_trace_override) {
+    LogPendingWcharEncoding();
     return true;
   }
 
@@ -250,6 +303,7 @@ bool TraceOptions::InitializeLogging(bool is_trace_override) {
         GetAbslSeverity(static_cast<LogLevel>(trace_opts->log_level));
     absl::SetMinLogLevel(static_cast<absl::LogSeverityAtLeast>(log_severity));
     FileLogSink::InitializeFileLog(trace_opts);
+    LogPendingWcharEncoding();
     return true;
   }
 
@@ -260,6 +314,7 @@ bool TraceOptions::InitializeLogging(bool is_trace_override) {
 
   FileLogSink::InitializeFileLog(trace_opts);
   trace_opts->logging_enabled = true;
+  LogPendingWcharEncoding();
   return true;
 }
 
@@ -310,12 +365,11 @@ TraceOptions::CreateTraceOptionsFile(
       log_file_size = std::strtol(s.second.c_str(), nullptr, 10);
     } else if (s.first == kMaxThreadsParam) {
       max_threads = std::stoull(s.second);
-#if !defined(_WIN32)
-    } else if (s.first == kWcharEncoding) {
-      SetWcharEncodingFromConfig(s.second);
-#endif
     }
   }
+#if !defined(_WIN32)
+  ApplyWcharEncodingConfig(trace_sections);
+#endif
 
   if (log_level > 0) {
     options_file_->log_level = log_level;

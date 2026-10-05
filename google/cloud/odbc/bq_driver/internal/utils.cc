@@ -22,6 +22,7 @@
 #include "google/cloud/internal/getenv.h"
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <random>
 #include <sstream>
@@ -45,7 +46,7 @@ WireEncoding GetEffectiveWireEncoding() { return WireEncoding::kUtf16Le; }
 
 size_t WireWcharSize() { return sizeof(SQLWCHAR); }
 
-void SetWcharEncodingFromConfig(std::string const&) {
+void SetWireEncoding(WireEncoding) {
   // No-op on Windows: SQLWCHAR is always 2-byte UTF-16LE.
 }
 #else
@@ -76,19 +77,73 @@ size_t WireWcharSize() {
   return sizeof(SQLWCHAR);
 }
 
-void SetWcharEncodingFromConfig(std::string const& value) {
-  if (value == "UTF-8" || value == "UTF8") {
-    g_wire_encoding.store(WireEncoding::kUtf8, std::memory_order_relaxed);
-  } else if (value == "UTF-16LE" || value == "UTF16LE" || value == "UTF-16") {
-    g_wire_encoding.store(WireEncoding::kUtf16Le, std::memory_order_relaxed);
-  } else if (value == "UTF-32LE" || value == "UTF32LE" || value == "UTF-32" ||
-             value == "UCS-4LE") {
-    g_wire_encoding.store(WireEncoding::kUtf32Le, std::memory_order_relaxed);
-  } else if (value.empty() || value == "default") {
-    g_wire_encoding.store(WireEncoding::kDefault, std::memory_order_relaxed);
-  }
+void SetWireEncoding(WireEncoding encoding) {
+  g_wire_encoding.store(encoding, std::memory_order_relaxed);
 }
 #endif
+
+std::string WireEncodingName(WireEncoding encoding) {
+  switch (encoding) {
+    case WireEncoding::kUtf8:
+      return "UTF-8";
+    case WireEncoding::kUtf16Le:
+      return "UTF-16LE";
+    case WireEncoding::kUtf32Le:
+      return "UTF-32LE";
+    case WireEncoding::kDefault:
+      return "default";
+  }
+  return "default";
+}
+
+std::optional<WireEncoding> ParseWireEncoding(std::string_view value) {
+  std::string normalized(value);
+  Trim(normalized);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return std::toupper(c); });
+  if (normalized.empty() || normalized == "DEFAULT") {
+    return WireEncoding::kDefault;
+  }
+  if (normalized == "UTF-8" || normalized == "UTF8") {
+    return WireEncoding::kUtf8;
+  }
+  if (normalized == "UTF-16" || normalized == "UTF-16LE" ||
+      normalized == "UTF16LE") {
+    return WireEncoding::kUtf16Le;
+  }
+  if (normalized == "UTF-32" || normalized == "UTF-32LE" ||
+      normalized == "UTF32LE" || normalized == "UCS-4LE") {
+    return WireEncoding::kUtf32Le;
+  }
+  return std::nullopt;
+}
+
+WcharEncodingConfig ResolveWcharEncoding(Section const& driver_section) {
+  WcharEncodingConfig config;
+  auto const wchar_it = driver_section.find(kWcharEncodingKey);
+  auto const dm_it = driver_section.find(kDriverManagerEncodingKey);
+  if (wchar_it == driver_section.end() && dm_it == driver_section.end()) {
+    return config;
+  }
+  auto const& selected =
+      (wchar_it != driver_section.end()) ? *wchar_it : *dm_it;
+  if (wchar_it != driver_section.end() && dm_it != driver_section.end()) {
+    config.warnings.push_back(std::string("Both ") + kWcharEncodingKey + "=" +
+                              wchar_it->second + " and " +
+                              kDriverManagerEncodingKey + "=" + dm_it->second +
+                              " are set; using " + kWcharEncodingKey + ".");
+  }
+  auto parsed = ParseWireEncoding(selected.second);
+  if (!parsed) {
+    config.errors.push_back("Unrecognized " + selected.first + " value '" +
+                            selected.second +
+                            "'; expected UTF-8, UTF-16LE, UTF-32LE or "
+                            "default. Using the default encoding.");
+    return config;
+  }
+  config.encoding = *parsed;
+  return config;
+}
 
 #ifdef _WIN32
 using google::cloud::odbc_bigquery_client_interface::OauthMechanism;
@@ -990,10 +1045,20 @@ odbc_internal::StatusRecordOr<std::string> BqConvertSQLWCHARToString(
         count = 0;
         while (utf16[count] != 0) ++count;
       }
+      // wchar_t holds UTF-32 here, so combine surrogate pairs. A lone
+      // surrogate becomes U+FFFD.
       std::wstring wstr;
       wstr.reserve(count);
       for (SQLINTEGER i = 0; i < count; ++i) {
-        wstr.push_back(static_cast<wchar_t>(utf16[i]));
+        std::uint32_t cp = utf16[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < count &&
+            utf16[i + 1] >= 0xDC00 && utf16[i + 1] <= 0xDFFF) {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (utf16[i + 1] - 0xDC00);
+          ++i;
+        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+          cp = 0xFFFD;
+        }
+        wstr.push_back(static_cast<wchar_t>(cp));
       }
       return Utf16ToUtf8(wstr);
     }

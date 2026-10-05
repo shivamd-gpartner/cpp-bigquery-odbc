@@ -25,11 +25,16 @@
 #include "google/cloud/odbc/bq_driver/internal/trace_utils.h"
 #include "google/cloud/odbc/bq_driver/odbc_utils.h"
 #include "google/cloud/odbc/internal/status_record_or.h"
+#include <cstring>
+#include <limits>
+#include <string_view>
+#include <vector>
 
 namespace google::cloud::odbc_bq_driver {
 
 using google::cloud::odbc_bigquery_client_interface::ODBCBQClient;
 using google::cloud::odbc_bq_driver_internal::ConnectionHandle;
+using google::cloud::odbc_bq_driver_internal::CopyUtf8ToWireBuffer;
 using google::cloud::odbc_bq_driver_internal::CreateResultSetForTableTypes;
 using google::cloud::odbc_bq_driver_internal::DescriptorHandle;
 using google::cloud::odbc_bq_driver_internal::DescriptorType;
@@ -43,6 +48,7 @@ using google::cloud::odbc_bq_driver_internal::GetResultSetForProjects;
 using google::cloud::odbc_bq_driver_internal::GetResultSetForTables;
 using google::cloud::odbc_bq_driver_internal::IsFunctionIdOdbc2;
 using google::cloud::odbc_bq_driver_internal::IsFunctionIdOdbc3;
+using google::cloud::odbc_bq_driver_internal::IsInfoTypeString;
 using google::cloud::odbc_bq_driver_internal::kDriverOdbcVer;
 using google::cloud::odbc_bq_driver_internal::kForeignKeysMap;
 using google::cloud::odbc_bq_driver_internal::kMatchAll;
@@ -58,6 +64,7 @@ using google::cloud::odbc_bq_driver_internal::ProcessQueryResults;
 using google::cloud::odbc_bq_driver_internal::ProcessTableResults;
 using google::cloud::odbc_bq_driver_internal::ResultSet;
 using google::cloud::odbc_bq_driver_internal::SanitizeIdentifierArgument;
+using google::cloud::odbc_bq_driver_internal::SaturateLength;
 using google::cloud::odbc_bq_driver_internal::SQLGetInfoBitmask;
 using google::cloud::odbc_bq_driver_internal::SQLGetInfoSqlChar;
 using google::cloud::odbc_bq_driver_internal::SQLGetInfoSqlUInt;
@@ -70,6 +77,8 @@ using google::cloud::odbc_bq_driver_internal::UnSupportedInfoType;
 using google::cloud::odbc_bq_driver_internal::ValidateColumnParameters;
 using google::cloud::odbc_bq_driver_internal::ValidateInputParameters;
 using google::cloud::odbc_bq_driver_internal::ValidateProcedureColumnParameters;
+using google::cloud::odbc_bq_driver_internal::WireUnitsForBytes;
+using google::cloud::odbc_bq_driver_internal::WireWcharSize;
 using google::cloud::odbc_internal::SQLStates;
 using google::cloud::odbc_internal::StatusRecord;
 using google::cloud::odbc_internal::StatusRecordOr;
@@ -266,6 +275,49 @@ SQLRETURN SQLGetInfoInternal(SQLHDBC connection_handle, SQLUSMALLINT info_type,
       InvalidType("SQLGetInfoInternal - Invalid infoType: ", info_type);
   LOG(ERROR) << "SQLGetInfo::InvalidType:: " << status_record.message;
   return LogAndReturnCode(*handle, status_record);
+}
+
+SQLRETURN SQLGetInfoWInternal(SQLHDBC connection_handle, SQLUSMALLINT info_type,
+                              SQLPOINTER info_value_ptr,
+                              SQLSMALLINT in_buffer_len,
+                              SQLSMALLINT* str_len_ptr) {
+  // Non-string values are identical for both variants; a negative length is
+  // rejected by SQLGetInfoInternal before anything is written.
+  if (!IsInfoTypeString(info_type) || in_buffer_len < 0) {
+    return SQLGetInfoInternal(connection_handle, info_type, info_value_ptr,
+                              in_buffer_len, str_len_ptr);
+  }
+
+  // Fetch the UTF-8 value into a local buffer sized independently of the
+  // caller's, then copy it into the caller's SQLWCHAR buffer of
+  // in_buffer_len bytes.
+  std::vector<SQLCHAR> utf8(std::numeric_limits<SQLSMALLINT>::max(), 0);
+  SQLSMALLINT utf8_len = 0;
+  SQLRETURN rc =
+      SQLGetInfoInternal(connection_handle, info_type, utf8.data(),
+                         static_cast<SQLSMALLINT>(utf8.size()), &utf8_len);
+  if (!SQL_SUCCEEDED(rc)) return rc;
+
+  auto& handle = *reinterpret_cast<ConnectionHandle*>(connection_handle);
+  auto const* value = reinterpret_cast<char const*>(utf8.data());
+  auto copied =
+      CopyUtf8ToWireBuffer(std::string_view(value, std::strlen(value)),
+                           info_value_ptr, WireUnitsForBytes(in_buffer_len));
+  if (!copied) {
+    LOG(ERROR) << "SQLGetInfoW:: " << copied.GetStatusRecord().message;
+    return LogAndReturnCode(handle, copied.GetStatusRecord());
+  }
+  if (str_len_ptr) {
+    *str_len_ptr =
+        SaturateLength<SQLSMALLINT>(copied->total_units * WireWcharSize());
+  }
+  if (copied->truncated) {
+    LOG(WARNING) << "SQLGetInfoW:: String data, right truncated";
+    return LogAndReturnCode(
+        handle,
+        StatusRecord{SQLStates::k_01004(), "String data, right truncated"});
+  }
+  return rc;
 }
 
 SQLRETURN SQLPrimaryKeysInternal(SQLHSTMT stmt_handle,

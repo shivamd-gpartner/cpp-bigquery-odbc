@@ -20,7 +20,9 @@
 // ODBC diagnostics:
 //
 // SQLGetDiagFieldInternal
+// SQLGetDiagFieldWInternal
 // SQLGetDiagRecInternal
+// SQLGetDiagRecWInternal
 ///////////////////////////////////////////////////////////
 
 #include "google/cloud/odbc/internal/odbc_includes.h"
@@ -39,6 +41,26 @@ SQLRETURN SQLGetDiagRecInternal(SQLSMALLINT handle_type, SQLHANDLE handle,
                                 SQLINTEGER* native_error, SQLCHAR* message_text,
                                 SQLSMALLINT message_text_buffer_len,
                                 SQLSMALLINT* message_text_len);
+
+// Unicode variant of SQLGetDiagFieldInternal. For string fields `diag_info`
+// is a SQLWCHAR buffer of `diag_info_buffer_len` bytes, and
+// `*diag_info_string_len` is set to the full length in bytes.
+SQLRETURN SQLGetDiagFieldWInternal(SQLSMALLINT handle_type, SQLHANDLE handle,
+                                   SQLSMALLINT rec_number,
+                                   SQLSMALLINT diag_identifier,
+                                   SQLPOINTER diag_info,
+                                   SQLSMALLINT diag_info_buffer_len,
+                                   SQLSMALLINT* diag_info_string_len);
+
+// Unicode variant of SQLGetDiagRecInternal. `sql_state` must hold 6 wire
+// code units, `message_text` holds `message_text_buffer_len` wire code units,
+// and `*message_text_len` is set to the full message length in characters.
+SQLRETURN SQLGetDiagRecWInternal(SQLSMALLINT handle_type, SQLHANDLE handle,
+                                 SQLSMALLINT rec_number, SQLWCHAR* sql_state,
+                                 SQLINTEGER* native_error,
+                                 SQLWCHAR* message_text,
+                                 SQLSMALLINT message_text_buffer_len,
+                                 SQLSMALLINT* message_text_len);
 
 }  // namespace google::cloud::odbc_bq_driver
 

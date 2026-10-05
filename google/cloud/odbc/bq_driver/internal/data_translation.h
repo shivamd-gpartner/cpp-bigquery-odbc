@@ -277,12 +277,14 @@ inline odbc_internal::StatusRecord ConvertFromArithmeticDSValue(
     }
     case SQL_WCHAR: {
       std::string str = std::to_string(src_val);
-      int src_len = str.length();
       StatusRecordOr<std::wstring> wstr = Utf8ToUtf16(str);
 
+      // dest_data.buflen is in bytes; the response takes wire code units.
+      auto const capacity =
+          static_cast<SQLLEN>(WireUnitsForBytes(dest_data.buflen));
       StatusRecord status_record = WStrToOutputBufferResponse(
-          wstr.GetValue(), dest_data.buf, dest_data.buflen, src_len,
-          dest_data.buflen, dest_data.result_len);
+          wstr.GetValue(), dest_data.buf, capacity,
+          static_cast<SQLINTEGER>(capacity), dest_data.result_len);
       if (status_record.sql_state == SQLStates::k_01004()) {
         LOG(ERROR) << "ConvertFromArithmeticDSValue::"
                       "WStrToOutputBufferResponse:: Numeric value out of range";

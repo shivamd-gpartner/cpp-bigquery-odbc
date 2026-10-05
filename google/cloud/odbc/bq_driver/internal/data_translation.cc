@@ -108,7 +108,7 @@ odbc_internal::StatusRecord ConvertFromNumericDSValue(DSValue const& src_dsval,
       auto src_len = static_cast<SQLINTEGER>(wstr->length());
       SQLINTEGER required_chars = src_len + 1;
       WStrToOutputBufferResponse(wstr.GetValue(), dest_data.buf, wchar_capacity,
-                                 src_len, required_chars, dest_data.result_len);
+                                 required_chars, dest_data.result_len);
       return status_record;
     }
     case SQL_C_FLOAT:
@@ -329,8 +329,7 @@ odbc_internal::StatusRecord ConvertFromStringDSValue(DSValue const& src_dsval,
     SQLLEN wchar_capacity = dest_data.buflen / WireWcharSize();
     SQLINTEGER required_chars = src_len + 1;
     return WStrToOutputBufferResponse(wide_str, dest_data.buf, wchar_capacity,
-                                      src_len, required_chars,
-                                      dest_data.result_len);
+                                      required_chars, dest_data.result_len);
   }
 
   std::string src_str(src_view);
@@ -899,7 +898,6 @@ odbc_internal::StatusRecord ConvertFromTimeDSValue(DSValue const& src_dsval,
     case SQL_C_WCHAR: {
       std::string time_src_str;
       time_src_str = FormatTimetoString(dest_time);
-      SQLINTEGER k_time_src_len = time_src_str.length();
       SQLINTEGER supp_max_len = 9;
       StatusRecordOr<std::wstring> wstr = Utf8ToUtf16(time_src_str);
       if (!wstr) {
@@ -910,8 +908,8 @@ odbc_internal::StatusRecord ConvertFromTimeDSValue(DSValue const& src_dsval,
       SQLLEN wchar_capacity = buffer_length / WireWcharSize();
       SQLLEN required_chars = static_cast<SQLLEN>(wstr->length()) + 1;
       return WStrToOutputBufferResponse(
-          wstr.GetValue(), dest_buf, wchar_capacity, k_time_src_len,
-          required_chars, reinterpret_cast<SQLLEN*>(dest_data.result_len));
+          wstr.GetValue(), dest_buf, wchar_capacity, required_chars,
+          reinterpret_cast<SQLLEN*>(dest_data.result_len));
       break;
     }
     case SQL_C_BINARY: {
@@ -1010,19 +1008,17 @@ odbc_internal::StatusRecord ConvertFromTimestampDSValue(
       size_t const wire_sz = WireWcharSize();
       SQLLEN wchar_capacity = buffer_length / static_cast<SQLLEN>(wire_sz);
       if (wchar_capacity > k_timestamp_src_len) {
+        auto copied =
+            CopyWideToWireBuffer(wstr.GetValue(), dest_buf, wchar_capacity);
         if (res_len) {
-          *res_len = static_cast<SQLLEN>(wstr.GetValue().size() * wire_sz);
+          *res_len = static_cast<SQLLEN>(copied.total_units * wire_sz);
         }
-        WriteWideToWireBuffer(wstr.GetValue(), dest_buf, wstr.GetValue().size(),
-                              /*null_terminate=*/true);
       } else if (20 <= wchar_capacity &&
                  wchar_capacity <= k_timestamp_src_len) {
         if (res_len) {
           *res_len = wchar_capacity * static_cast<SQLLEN>(wire_sz);
         }
-        WriteWideToWireBuffer(wstr.GetValue(), dest_buf,
-                              static_cast<size_t>(wchar_capacity - 1),
-                              /*null_terminate=*/true);
+        CopyWideToWireBuffer(wstr.GetValue(), dest_buf, wchar_capacity);
         LOG(WARNING)
             << "ConvertFromTimestampDSValue:: Data truncated for SQL_C_WCHAR.";
         status_record = StatusRecord{SQLStates::k_01004(), "Data truncated"};
@@ -1184,18 +1180,16 @@ odbc_internal::StatusRecord ConvertFromDatetimeDSValue(DSValue const& src_dsval,
       size_t const wire_sz = WireWcharSize();
       SQLLEN wchar_capacity = buffer_length / static_cast<SQLLEN>(wire_sz);
       if (wchar_capacity > k_datetime_src_len) {
+        auto copied =
+            CopyWideToWireBuffer(wstr.GetValue(), dest_buf, wchar_capacity);
         if (res_len) {
-          *res_len = static_cast<SQLLEN>(wstr.GetValue().size() * wire_sz);
+          *res_len = static_cast<SQLLEN>(copied.total_units * wire_sz);
         }
-        WriteWideToWireBuffer(wstr.GetValue(), dest_buf, wstr.GetValue().size(),
-                              /*null_terminate=*/true);
       } else if (20 <= wchar_capacity && wchar_capacity <= k_datetime_src_len) {
         if (res_len) {
           *res_len = wchar_capacity * static_cast<SQLLEN>(wire_sz);
         }
-        WriteWideToWireBuffer(wstr.GetValue(), dest_buf,
-                              static_cast<size_t>(wchar_capacity - 1),
-                              /*null_terminate=*/true);
+        CopyWideToWireBuffer(wstr.GetValue(), dest_buf, wchar_capacity);
         LOG(WARNING)
             << "ConvertFromDatetimeDSValue:: Data truncated for SQL_C_WCHAR.";
         status_record = StatusRecord{SQLStates::k_01004(), "Data truncated"};
@@ -1386,7 +1380,7 @@ odbc_internal::StatusRecord ConvertFromDateDSValue(DSValue const& src_dsval,
       auto src_len = static_cast<SQLINTEGER>(wstr->length());
       SQLINTEGER required_chars = src_len + 1;
       return WStrToOutputBufferResponse(
-          wstr.GetValue(), dest_buf, wchar_capacity, src_len, required_chars,
+          wstr.GetValue(), dest_buf, wchar_capacity, required_chars,
           reinterpret_cast<SQLLEN*>(dest_data.result_len));
     }
     default:
@@ -1422,7 +1416,7 @@ StatusRecord ConvertStringToJsonOutputBuffer(std::string const& src_str,
       auto src_len = static_cast<SQLINTEGER>(wide_string->length());
       SQLINTEGER required_chars = src_len + 1;
       return WStrToOutputBufferResponse(wide_string.GetValue(), dest_buf,
-                                        wchar_capacity, src_len, required_chars,
+                                        wchar_capacity, required_chars,
                                         reinterpret_cast<SQLLEN*>(res_len));
     }
     case SQL_C_BINARY: {
@@ -1486,7 +1480,7 @@ StatusRecord ConvertFromArrayDSValue(DSValue const& src_dsval,
       auto src_len = static_cast<SQLINTEGER>(wide_string->length());
       SQLINTEGER required_chars = src_len + 1;
       return WStrToOutputBufferResponse(
-          *wide_string, dest_data.buf, wchar_capacity, src_len, required_chars,
+          *wide_string, dest_data.buf, wchar_capacity, required_chars,
           reinterpret_cast<SQLLEN*>(dest_data.result_len));
     }
     case SQL_C_BINARY: {
@@ -1602,11 +1596,9 @@ odbc_internal::StatusRecord ConvertFromIntervalDSValue(DSValue const& src_dsval,
         break;
       }
       SQLLEN wchar_capacity = buffer_length / WireWcharSize();
-      auto interval_char_length =
-          static_cast<SQLINTEGER>(wstr.GetValue().length());
       return WStrIntervalBufferResponse(
-          wstr.GetValue(), dest_buf, wchar_capacity, interval_char_length,
-          whole_digit_count, reinterpret_cast<SQLLEN*>(dest_data.result_len));
+          wstr.GetValue(), dest_buf, wchar_capacity, whole_digit_count,
+          reinterpret_cast<SQLLEN*>(dest_data.result_len));
       break;
     }
     case SQL_C_STINYINT: {
@@ -1891,7 +1883,7 @@ StatusRecord ConvertFromGeographyDSValue(DSValue const& src_dsval,
       SQLLEN src_len = static_cast<SQLLEN>(wide_str.length());
       SQLLEN required_chars = src_len + 1;
       status_record = WStrToOutputBufferResponse(
-          wide_str, dest_data.buf, wchar_capacity, src_len, required_chars,
+          wide_str, dest_data.buf, wchar_capacity, required_chars,
           reinterpret_cast<SQLLEN*>(dest_data.result_len));
       break;
     }
@@ -2034,33 +2026,25 @@ StatusRecord ConvertBytesToWChar(DSValue const& conn_val,
                         "UTF-8 to UTF-16 conversion failed."};
   }
 
-  std::wstring const& utf16_value = utf16_str.GetValue();
-
-  // Narrow wchar_t -> wire encoding directly into the caller's buffer.
-  // No intermediate vector; WriteWideToWireBuffer is a memcpy when the wire
-  // SQLWCHAR width matches sizeof(wchar_t) and a per-element narrowing loop
-  // only on the iODBC-built / unixODBC-loaded path.
+  std::string const encoded = EncodeWideToWire(utf16_str.GetValue());
   size_t const wire_sz = WireWcharSize();
-  size_t const src_chars = utf16_value.size();
-  size_t const required_size = src_chars * wire_sz;
+  size_t const required_size = encoded.size();
+  size_t const buffer_size =
+      dest_data.buflen > 0 ? static_cast<size_t>(dest_data.buflen) : 0;
 
-  if (static_cast<size_t>(dest_data.buflen) < required_size) {
-    size_t num_chars_to_copy = dest_data.buflen / wire_sz;
-    if (num_chars_to_copy > 0) {
-      num_chars_to_copy--;  // leave one slot for the null terminator
-      WriteWideToWireBuffer(utf16_value, dest_data.buf, num_chars_to_copy,
-                            /*null_terminate=*/true);
-    }
+  if (buffer_size < required_size) {
+    CopyWireUnitsToBuffer(encoded, dest_data.buf, buffer_size / wire_sz);
     if (dest_data.result_len) {
       *dest_data.result_len = required_size;
     }
     LOG(WARNING) << "ConvertBytesToWChar:: String data, right truncated.";
     return StatusRecord{SQLStates::k_01004(), "String data, right truncated"};
   }
-  bool const can_null_terminate =
-      static_cast<size_t>(dest_data.buflen) >= required_size + wire_sz;
-  WriteWideToWireBuffer(utf16_value, dest_data.buf, src_chars,
-                        can_null_terminate);
+  // The data fits; the NUL terminator is written only if there is room for it.
+  std::memcpy(dest_data.buf, encoded.data(), required_size);
+  if (buffer_size >= required_size + wire_sz) {
+    std::memset(static_cast<char*>(dest_data.buf) + required_size, 0, wire_sz);
+  }
   if (dest_data.result_len) {
     *dest_data.result_len = required_size;
   }
@@ -2234,8 +2218,8 @@ StatusRecord ConvertFromRangeDSValue(DSValue const& src_dsval,
       SQLLEN src_len = static_cast<SQLLEN>(wstr->length());
       SQLLEN required_chars = src_len + 1;
       return WStrToOutputBufferResponse(
-          wstr.GetValue(), dest_data.buf, wchar_capacity, src_len,
-          required_chars, reinterpret_cast<SQLLEN*>(dest_data.result_len));
+          wstr.GetValue(), dest_data.buf, wchar_capacity, required_chars,
+          reinterpret_cast<SQLLEN*>(dest_data.result_len));
     }
     default: {
       LOG(ERROR) << "Unsupported conversion type for range DSValue: "

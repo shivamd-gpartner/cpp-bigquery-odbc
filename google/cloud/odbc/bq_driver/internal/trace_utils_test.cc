@@ -13,14 +13,18 @@
 // limitations under the License.
 
 #include "google/cloud/odbc/bq_driver/internal/trace_utils.h"
+#include "google/cloud/odbc/testing/bq_driver_utils/utils.h"
 #include "google/cloud/odbc/testing/utils/status_matchers.h"
 #include "google/cloud/internal/getenv.h"
 #include "absl/strings/str_format.h"
 #include <gtest/gtest.h>
+#include <filesystem>
+#include <fstream>
 
 namespace google::cloud::odbc_bq_driver_internal {
 
 using ::google::cloud::odbc_internal::SQLStates;
+using google::cloud::odbc_testing_bq_driver_utils::ScopedWireEncoding;
 using google::cloud::odbc_testing_utils::StatusRecordIs;
 
 // Common Test Values.
@@ -154,5 +158,60 @@ TEST(ClearOldLogFiles, IgnoresMissingOldFile) {
 //   }
 // }
 #endif  // _WIN32
+
+#if !defined(_WIN32)
+namespace {
+
+// Reads a googlebigqueryodbc.ini whose [Driver] section is `driver_lines` the
+// way SQLAllocHandle(SQL_HANDLE_ENV) does, and returns the resulting
+// WireWcharSize().
+std::size_t WireWcharSizeAfterReadingIni(std::string const& driver_lines) {
+  auto const path = std::filesystem::temp_directory_path() /
+                    ("wchar_encoding_test_" + GenerateRandomId(8) + ".ini");
+  {
+    std::ofstream ini(path);
+    ini << "[Driver]\nLogLevel=0\n" << driver_lines << "\n";
+  }
+  auto opts = TraceOptions::CreateTraceOptionsFile(path.string());
+  std::filesystem::remove(path);
+  EXPECT_TRUE(opts.Ok());
+  return WireWcharSize();
+}
+
+}  // namespace
+
+TEST(ApplyWcharEncodingConfig, IniFileSelectsEncoding) {
+  ScopedWireEncoding reset(WireEncoding::kDefault);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding=UTF-16LE"), 2);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding = utf-8 "), 1);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding=UCS-4LE"), 4);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding="), sizeof(SQLWCHAR));
+}
+
+TEST(ApplyWcharEncodingConfig, DriverManagerEncodingAliasMatchesWcharEncoding) {
+  ScopedWireEncoding reset(WireEncoding::kDefault);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("DriverManagerEncoding=UTF-16"), 2);
+  EXPECT_EQ(GetEffectiveWireEncoding(), WireEncoding::kUtf16Le);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding=UTF-16LE"), 2);
+  EXPECT_EQ(GetEffectiveWireEncoding(), WireEncoding::kUtf16Le);
+}
+
+TEST(ApplyWcharEncodingConfig, WcharEncodingWinsOverAlias) {
+  ScopedWireEncoding reset(WireEncoding::kDefault);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni(
+                "DriverManagerEncoding=UTF-16\nWcharEncoding=UTF-8"),
+            1);
+}
+
+TEST(ApplyWcharEncodingConfig, InvalidOrMissingValueUsesDefault) {
+  ScopedWireEncoding reset(WireEncoding::kDefault);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding=UTF-16LE"), 2);
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding=UTF-16BE"),
+            sizeof(SQLWCHAR));
+  EXPECT_EQ(WireWcharSizeAfterReadingIni("WcharEncoding=UTF-16LE"), 2);
+  // Removing the key from the ini restores the default on the next read.
+  EXPECT_EQ(WireWcharSizeAfterReadingIni(""), sizeof(SQLWCHAR));
+}
+#endif  // !defined(_WIN32)
 
 }  // namespace google::cloud::odbc_bq_driver_internal

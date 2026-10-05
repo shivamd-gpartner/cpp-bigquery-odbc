@@ -21,6 +21,7 @@
 #include "google/cloud/odbc/bq_driver/odbc_utils.h"
 #include "google/cloud/odbc/testing/bq_driver_utils/handles.h"
 #include "google/cloud/odbc/testing/bq_driver_utils/status_utils.h"
+#include "google/cloud/odbc/testing/bq_driver_utils/utils.h"
 #include "google/cloud/odbc/testing/utils/status_matchers.h"
 #include <gtest/gtest.h>
 
@@ -32,10 +33,15 @@ using ::google::cloud::odbc_bq_driver_internal::kSqlApiAllFuncsSize;
 using ::google::cloud::odbc_bq_driver_internal::Section;
 using ::google::cloud::odbc_bq_driver_internal::StatementHandle;
 using ::google::cloud::odbc_bq_driver_internal::StmtStates;
+using ::google::cloud::odbc_bq_driver_internal::WireEncoding;
+using ::google::cloud::odbc_bq_driver_internal::WireWcharSize;
 using ::google::cloud::odbc_internal::SQLStates;
 using google::cloud::odbc_internal::StatusRecord;
+using ::google::cloud::odbc_testing_bq_driver_utils::CanaryBuffer;
 using ::google::cloud::odbc_testing_bq_driver_utils::CreateConnectionHandle;
+using ::google::cloud::odbc_testing_bq_driver_utils::DecodeWire;
 using ::google::cloud::odbc_testing_bq_driver_utils::GetLastStatusRecord;
+using ::google::cloud::odbc_testing_bq_driver_utils::ScopedWireEncoding;
 
 std::string const kDsnDescription = "test-dsn";
 std::string const kDsnCatalog = "bigquery-test";
@@ -1120,5 +1126,95 @@ TEST(SQLProcedureColumnsInternal, FailureCatalognameissearchpattern) {
   EXPECT_EQ(status_record.sql_state, SQLStates::k_HY090());
   EXPECT_EQ(status_record.message, "Catalog name cannot be a search pattern");
 }
+
+class SQLGetInfoWInternalTest : public ::testing::TestWithParam<WireEncoding> {
+ protected:
+  SQLGetInfoWInternalTest() : encoding_(GetParam()) {
+    CreateConnectedHandleWithDsn();
+  }
+  ~SQLGetInfoWInternalTest() override { FreeHandles(); }
+
+  ScopedWireEncoding encoding_;
+};
+
+TEST_P(SQLGetInfoWInternalTest, StringFitsWithNul) {
+  std::size_t const wire_sz = WireWcharSize();
+  auto const buffer_bytes = static_cast<SQLSMALLINT>(32 * wire_sz);
+  CanaryBuffer dest(buffer_bytes);
+  SQLSMALLINT str_len = -1;
+
+  ASSERT_EQ(SQL_SUCCESS,
+            SQLGetInfoWInternal(connection_handle, SQL_DATA_SOURCE_NAME,
+                                dest.data(), buffer_bytes, &str_len));
+  EXPECT_TRUE(dest.CanariesIntact());
+  EXPECT_EQ(DecodeWire(dest.data(), kDsnName.size()), kDsnName);
+  EXPECT_TRUE(dest.IsNulAt(kDsnName.size(), wire_sz));
+  // In bytes for SQLGetInfoW.
+  EXPECT_EQ(str_len, kDsnName.size() * wire_sz);
+}
+
+TEST_P(SQLGetInfoWInternalTest, TruncationStaysInsideBuffer) {
+  std::size_t const wire_sz = WireWcharSize();
+  // 4 whole code units plus a stray byte that must not be used.
+  auto const buffer_bytes = static_cast<SQLSMALLINT>(4 * wire_sz + 1);
+  CanaryBuffer dest(buffer_bytes);
+  SQLSMALLINT str_len = -1;
+
+  ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+            SQLGetInfoWInternal(connection_handle, SQL_DATA_SOURCE_NAME,
+                                dest.data(), buffer_bytes, &str_len));
+  // With 1-byte code units the extra byte is a whole code unit.
+  std::size_t const kept = buffer_bytes / wire_sz - 1;
+  EXPECT_TRUE(dest.CanariesIntact());
+  EXPECT_EQ(DecodeWire(dest.data(), kept), kDsnName.substr(0, kept));
+  EXPECT_TRUE(dest.IsNulAt(kept, wire_sz));
+  if (wire_sz > 1) {
+    EXPECT_EQ(dest.bytes()[4 * wire_sz], CanaryBuffer::kFill);
+  }
+  EXPECT_EQ(str_len, kDsnName.size() * wire_sz);
+  EXPECT_EQ(GetLastStatusRecord(*connection_handle).sql_state,
+            SQLStates::k_01004());
+}
+
+TEST_P(SQLGetInfoWInternalTest, TooSmallForAnyCodeUnit) {
+  std::size_t const wire_sz = WireWcharSize();
+  auto const buffer_bytes = static_cast<SQLSMALLINT>(wire_sz - 1);
+  CanaryBuffer dest(buffer_bytes);
+  SQLSMALLINT str_len = -1;
+
+  ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+            SQLGetInfoWInternal(connection_handle, SQL_DATA_SOURCE_NAME,
+                                dest.data(), buffer_bytes, &str_len));
+  EXPECT_TRUE(dest.CanariesIntact());
+  EXPECT_EQ(str_len, kDsnName.size() * wire_sz);
+}
+
+TEST_P(SQLGetInfoWInternalTest, NullBufferReportsLength) {
+  SQLSMALLINT str_len = -1;
+  ASSERT_EQ(SQL_SUCCESS,
+            SQLGetInfoWInternal(connection_handle, SQL_DATA_SOURCE_NAME,
+                                nullptr, 0, &str_len));
+  EXPECT_EQ(str_len, kDsnName.size() * WireWcharSize());
+}
+
+TEST_P(SQLGetInfoWInternalTest, NonStringValueIsUnchanged) {
+  SQLUSMALLINT value = 0;
+  SQLSMALLINT str_len = -1;
+  ASSERT_EQ(SQL_SUCCESS, SQLGetInfoWInternal(connection_handle,
+                                             SQL_MAX_CONCURRENT_ACTIVITIES,
+                                             &value, sizeof(value), &str_len));
+  SQLUSMALLINT expected = 0;
+  SQLSMALLINT expected_len = -1;
+  ASSERT_EQ(SQL_SUCCESS,
+            SQLGetInfoInternal(connection_handle, SQL_MAX_CONCURRENT_ACTIVITIES,
+                               &expected, sizeof(expected), &expected_len));
+  EXPECT_EQ(value, expected);
+  EXPECT_EQ(str_len, expected_len);
+}
+
+INSTANTIATE_TEST_SUITE_P(WireEncodings, SQLGetInfoWInternalTest,
+                         ::testing::Values(WireEncoding::kUtf8,
+                                           WireEncoding::kUtf16Le,
+                                           WireEncoding::kUtf32Le));
 
 }  // namespace google::cloud::odbc_bq_driver

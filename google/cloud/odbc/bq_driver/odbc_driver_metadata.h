@@ -20,6 +20,7 @@
 // features or metadata supported by driver or datasource:
 //
 // SQLGetInfoInternal
+// SQLGetInfoWInternal
 // SQLGetFunctionsInternal
 // SQLGetTypeInfoInternal
 // SQLColumnsInternal
@@ -61,6 +62,14 @@ SQLRETURN SQLGetInfoInternal(SQLHDBC connection_handle, SQLUSMALLINT info_type,
                              SQLPOINTER info_value_ptr,
                              SQLSMALLINT in_buffer_len,
                              SQLSMALLINT* str_len_ptr);
+
+// Unicode variant of SQLGetInfoInternal. For string information types
+// `info_value_ptr` is a SQLWCHAR buffer of `in_buffer_len` bytes, and
+// `*str_len_ptr` is set to the full length in bytes.
+SQLRETURN SQLGetInfoWInternal(SQLHDBC connection_handle, SQLUSMALLINT info_type,
+                              SQLPOINTER info_value_ptr,
+                              SQLSMALLINT in_buffer_len,
+                              SQLSMALLINT* str_len_ptr);
 
 // Implements the semantics for SQLGetTypeInfo ODBC API
 // as per the ODBC 3.8 spec and the design doc.

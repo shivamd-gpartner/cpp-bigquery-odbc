@@ -14,6 +14,7 @@
 
 #include "google/cloud/odbc/bq_driver/internal/utils.h"
 #include "google/cloud/odbc/bq_client_interface/setenv.h"
+#include "google/cloud/odbc/testing/bq_driver_utils/utils.h"
 #include "google/cloud/odbc/testing/utils/status_matchers.h"
 #include "google/cloud/internal/getenv.h"
 #include <gtest/gtest.h>
@@ -26,6 +27,7 @@ namespace google::cloud::odbc_bq_driver_internal {
 using ::google::cloud::odbc_internal::SQLStates;
 using ::google::cloud::odbc_internal::StatusRecord;
 using ::google::cloud::odbc_internal::StatusRecordOr;
+using google::cloud::odbc_testing_bq_driver_utils::ScopedWireEncoding;
 using google::cloud::odbc_testing_utils::StatusRecordIs;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
@@ -1084,6 +1086,140 @@ TEST(EscapeOdbcPattern, EscapedNameMatchesOnlyItself) {
   // Without escaping, '_' acts as a wildcard -- the behaviour being fixed.
   auto unescaped = BuildRegex("ODBC_TEST_DATASET", SQL_FALSE);
   EXPECT_TRUE(re2::RE2::FullMatch("ODBCxTESTyDATASET", *unescaped));
+}
+
+TEST(ParseWireEncoding, AcceptsEverySpellingIgnoringCaseAndWhitespace) {
+  struct Case {
+    std::string value;
+    WireEncoding expected;
+  };
+  std::vector<Case> const cases = {
+      {"UTF-8", WireEncoding::kUtf8},
+      {"UTF8", WireEncoding::kUtf8},
+      {"utf-8", WireEncoding::kUtf8},
+      {"  Utf8\t", WireEncoding::kUtf8},
+      {"UTF-16", WireEncoding::kUtf16Le},
+      {"UTF-16LE", WireEncoding::kUtf16Le},
+      {"UTF16LE", WireEncoding::kUtf16Le},
+      {"utf-16le", WireEncoding::kUtf16Le},
+      {" uTf-16 ", WireEncoding::kUtf16Le},
+      {"UTF-32", WireEncoding::kUtf32Le},
+      {"UTF-32LE", WireEncoding::kUtf32Le},
+      {"UTF32LE", WireEncoding::kUtf32Le},
+      {"UCS-4LE", WireEncoding::kUtf32Le},
+      {"ucs-4le", WireEncoding::kUtf32Le},
+      {"\tutf-32  ", WireEncoding::kUtf32Le},
+      {"", WireEncoding::kDefault},
+      {"   ", WireEncoding::kDefault},
+      {"default", WireEncoding::kDefault},
+      {"DEFAULT", WireEncoding::kDefault},
+      {" Default ", WireEncoding::kDefault},
+  };
+  for (auto const& c : cases) {
+    auto parsed = ParseWireEncoding(c.value);
+    ASSERT_TRUE(parsed.has_value()) << "value: '" << c.value << "'";
+    EXPECT_EQ(*parsed, c.expected) << "value: '" << c.value << "'";
+  }
+}
+
+TEST(ParseWireEncoding, RejectsUnknownValues) {
+  for (std::string const value :
+       {"UTF-16BE", "UCS-2", "UTF_16", "latin1", "16", "UTF-8 UTF-16"}) {
+    EXPECT_FALSE(ParseWireEncoding(value).has_value())
+        << "value: '" << value << "'";
+  }
+}
+
+TEST(ResolveWcharEncoding, NoKeyUsesDefault) {
+  auto config = ResolveWcharEncoding(Section{{"LogLevel", "4"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kDefault);
+  EXPECT_THAT(config.warnings, IsEmpty());
+  EXPECT_THAT(config.errors, IsEmpty());
+}
+
+TEST(ResolveWcharEncoding, WcharEncodingKey) {
+  auto config = ResolveWcharEncoding(Section{{"WcharEncoding", " utf-16le "}});
+  EXPECT_EQ(config.encoding, WireEncoding::kUtf16Le);
+  EXPECT_THAT(config.warnings, IsEmpty());
+  EXPECT_THAT(config.errors, IsEmpty());
+}
+
+TEST(ResolveWcharEncoding, DriverManagerEncodingAlias) {
+  auto config =
+      ResolveWcharEncoding(Section{{"DriverManagerEncoding", "UTF-16"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kUtf16Le);
+  EXPECT_THAT(config.warnings, IsEmpty());
+  EXPECT_THAT(config.errors, IsEmpty());
+
+  config = ResolveWcharEncoding(Section{{"DriverManagerEncoding", "UTF-32"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kUtf32Le);
+}
+
+TEST(ResolveWcharEncoding, WcharEncodingWinsOverAliasWithWarning) {
+  auto config = ResolveWcharEncoding(
+      Section{{"WcharEncoding", "UTF-8"}, {"DriverManagerEncoding", "UTF-16"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kUtf8);
+  ASSERT_EQ(config.warnings.size(), 1);
+  EXPECT_THAT(config.warnings[0], HasSubstr("WcharEncoding=UTF-8"));
+  EXPECT_THAT(config.warnings[0], HasSubstr("DriverManagerEncoding=UTF-16"));
+  EXPECT_THAT(config.errors, IsEmpty());
+}
+
+TEST(ResolveWcharEncoding, EmptyWcharEncodingStillWinsOverAlias) {
+  auto config = ResolveWcharEncoding(
+      Section{{"WcharEncoding", ""}, {"DriverManagerEncoding", "UTF-16"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kDefault);
+  EXPECT_EQ(config.warnings.size(), 1);
+}
+
+TEST(ResolveWcharEncoding, InvalidValueFallsBackToDefaultWithError) {
+  auto config = ResolveWcharEncoding(Section{{"WcharEncoding", "UTF-16BE"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kDefault);
+  ASSERT_EQ(config.errors.size(), 1);
+  EXPECT_THAT(config.errors[0], HasSubstr("WcharEncoding"));
+  EXPECT_THAT(config.errors[0], HasSubstr("'UTF-16BE'"));
+
+  config = ResolveWcharEncoding(Section{{"DriverManagerEncoding", "bogus"}});
+  EXPECT_EQ(config.encoding, WireEncoding::kDefault);
+  ASSERT_EQ(config.errors.size(), 1);
+  EXPECT_THAT(config.errors[0], HasSubstr("DriverManagerEncoding"));
+  EXPECT_THAT(config.errors[0], HasSubstr("'bogus'"));
+}
+
+#if !defined(_WIN32)
+TEST(WireWcharSize, MatchesConfiguredEncoding) {
+  {
+    ScopedWireEncoding encoding(WireEncoding::kUtf8);
+    EXPECT_EQ(GetEffectiveWireEncoding(), WireEncoding::kUtf8);
+    EXPECT_EQ(WireWcharSize(), 1);
+  }
+  {
+    ScopedWireEncoding encoding(WireEncoding::kUtf16Le);
+    EXPECT_EQ(GetEffectiveWireEncoding(), WireEncoding::kUtf16Le);
+    EXPECT_EQ(WireWcharSize(), 2);
+  }
+  {
+    ScopedWireEncoding encoding(WireEncoding::kUtf32Le);
+    EXPECT_EQ(GetEffectiveWireEncoding(), WireEncoding::kUtf32Le);
+    EXPECT_EQ(WireWcharSize(), 4);
+  }
+  {
+    ScopedWireEncoding encoding(WireEncoding::kDefault);
+    EXPECT_EQ(WireWcharSize(), sizeof(SQLWCHAR));
+    EXPECT_EQ(GetEffectiveWireEncoding(), sizeof(SQLWCHAR) == 2
+                                              ? WireEncoding::kUtf16Le
+                                              : WireEncoding::kUtf32Le);
+  }
+  // The scoped guards restore the build default.
+  EXPECT_EQ(WireWcharSize(), sizeof(SQLWCHAR));
+}
+#endif  // !defined(_WIN32)
+
+TEST(WireEncodingName, CanonicalNames) {
+  EXPECT_EQ(WireEncodingName(WireEncoding::kUtf8), "UTF-8");
+  EXPECT_EQ(WireEncodingName(WireEncoding::kUtf16Le), "UTF-16LE");
+  EXPECT_EQ(WireEncodingName(WireEncoding::kUtf32Le), "UTF-32LE");
+  EXPECT_EQ(WireEncodingName(WireEncoding::kDefault), "default");
 }
 
 }  // namespace google::cloud::odbc_bq_driver_internal

@@ -18,17 +18,26 @@
 #include "google/cloud/odbc/bq_driver/internal/trace_utils.h"
 #include "google/cloud/odbc/bq_driver/odbc_utils.h"
 #include "google/cloud/odbc/internal/status_record_or.h"
+#include <cstring>
+#include <limits>
+#include <string_view>
+#include <vector>
 
 namespace google::cloud::odbc_bq_driver {
 
 using google::cloud::odbc_bq_driver_internal::ConnectionHandle;
+using google::cloud::odbc_bq_driver_internal::CopyUtf8ToWireBuffer;
 using google::cloud::odbc_bq_driver_internal::DescriptorHandle;
 using google::cloud::odbc_bq_driver_internal::Diagnostics;
 using google::cloud::odbc_bq_driver_internal::EnvironmentHandle;
 using google::cloud::odbc_bq_driver_internal::HandleType;
 using google::cloud::odbc_bq_driver_internal::IntValueToOutputBufferResponse;
+using google::cloud::odbc_bq_driver_internal::IsDiagIdentifierString;
+using google::cloud::odbc_bq_driver_internal::SaturateLength;
 using google::cloud::odbc_bq_driver_internal::StatementHandle;
 using google::cloud::odbc_bq_driver_internal::StringValueToOutputBufferResponse;
+using google::cloud::odbc_bq_driver_internal::WireUnitsForBytes;
+using google::cloud::odbc_bq_driver_internal::WireWcharSize;
 using google::cloud::odbc_internal::SQLStates;
 using google::cloud::odbc_internal::StatusRecord;
 using google::cloud::odbc_internal::StatusRecordOr;
@@ -36,6 +45,14 @@ using google::cloud::odbc_internal::StatusRecordOr;
 static std::string const kPrefix = "[Google][ODBC BigQuery Driver] ";
 static std::string const kIso9075 = "ISO 9075";
 static std::string const kOdbc3 = "ODBC 3.0";
+// SQLSTATE is always 5 characters plus a NUL terminator.
+constexpr std::size_t kSqlStateUnits = 6;
+// Size of the UTF-8 buffers the W functions hand to the internal functions.
+// The SQLSMALLINT length arguments cannot describe anything longer, so this is
+// independent of, and never smaller than, the caller's buffer.
+constexpr SQLSMALLINT kUtf8DiagBufferLen =
+    std::numeric_limits<SQLSMALLINT>::max();
+
 static std::vector<std::string> const kOdbcSubclasses = {
     SQLStates::k_01S00(), SQLStates::k_01S01(), SQLStates::k_01S02(),
     SQLStates::k_01S06(), SQLStates::k_01S07(), SQLStates::k_07S01(),
@@ -260,6 +277,97 @@ SQLRETURN SQLGetDiagRecInternal(SQLSMALLINT handle_type, SQLHANDLE handle,
   // Writing down NativeErrorCode
   return IntValueToOutputBufferResponse<SQLINTEGER, SQLINTEGER>(
       status_record.native_error_code, native_error, nullptr);
+}
+
+SQLRETURN SQLGetDiagFieldWInternal(SQLSMALLINT handle_type, SQLHANDLE handle,
+                                   SQLSMALLINT rec_number,
+                                   SQLSMALLINT diag_identifier,
+                                   SQLPOINTER diag_info,
+                                   SQLSMALLINT diag_info_buffer_len,
+                                   SQLSMALLINT* diag_info_string_len) {
+  if (!IsDiagIdentifierString(diag_identifier)) {
+    return SQLGetDiagFieldInternal(handle_type, handle, rec_number,
+                                   diag_identifier, diag_info,
+                                   diag_info_buffer_len, diag_info_string_len);
+  }
+  if (diag_info_buffer_len < 0) {
+    LOG(ERROR) << "SQLGetDiagFieldW:: BufferLength is negative";
+    return SQL_ERROR;
+  }
+
+  // Fetch the UTF-8 value into a local buffer, then copy it into the caller's
+  // SQLWCHAR buffer of diag_info_buffer_len bytes.
+  std::vector<SQLCHAR> utf8(kUtf8DiagBufferLen, 0);
+  SQLSMALLINT utf8_len = 0;
+  SQLRETURN rc =
+      SQLGetDiagFieldInternal(handle_type, handle, rec_number, diag_identifier,
+                              utf8.data(), kUtf8DiagBufferLen, &utf8_len);
+  if (!SQL_SUCCEEDED(rc)) return rc;
+
+  std::string_view value(
+      reinterpret_cast<char const*>(utf8.data()),
+      std::strlen(reinterpret_cast<char const*>(utf8.data())));
+  auto copied = CopyUtf8ToWireBuffer(value, diag_info,
+                                     WireUnitsForBytes(diag_info_buffer_len));
+  if (!copied) {
+    LOG(ERROR) << "SQLGetDiagFieldW:: " << copied.GetStatusRecord().message;
+    return SQL_ERROR;
+  }
+  if (diag_info_string_len) {
+    *diag_info_string_len =
+        SaturateLength<SQLSMALLINT>(copied->total_units * WireWcharSize());
+  }
+  return copied->truncated ? SQL_SUCCESS_WITH_INFO : rc;
+}
+
+SQLRETURN SQLGetDiagRecWInternal(SQLSMALLINT handle_type, SQLHANDLE handle,
+                                 SQLSMALLINT rec_number, SQLWCHAR* sql_state,
+                                 SQLINTEGER* native_error,
+                                 SQLWCHAR* message_text,
+                                 SQLSMALLINT message_text_buffer_len,
+                                 SQLSMALLINT* message_text_len) {
+  if (message_text_buffer_len < 0) {
+    LOG(ERROR) << "SQLGetDiagRecW:: BufferLength is negative";
+    return SQL_ERROR;
+  }
+
+  // The internal function writes UTF-8 into local buffers that are sized
+  // independently of the caller's SQLWCHAR buffers. Only the bounded copies
+  // below touch caller memory.
+  SQLCHAR utf8_sql_state[kSqlStateUnits] = {0};
+  std::vector<SQLCHAR> utf8_message(kUtf8DiagBufferLen, 0);
+  SQLSMALLINT utf8_message_len = 0;
+  SQLRETURN rc = SQLGetDiagRecInternal(
+      handle_type, handle, rec_number, utf8_sql_state, native_error,
+      utf8_message.data(), kUtf8DiagBufferLen, &utf8_message_len);
+  if (!SQL_SUCCEEDED(rc)) return rc;
+
+  if (sql_state) {
+    // Exactly 5 characters and a NUL: kSqlStateUnits wire code units.
+    auto copied =
+        CopyUtf8ToWireBuffer(reinterpret_cast<char const*>(utf8_sql_state),
+                             sql_state, kSqlStateUnits);
+    if (!copied) {
+      LOG(ERROR) << "SQLGetDiagRecW:: " << copied.GetStatusRecord().message;
+      return SQL_ERROR;
+    }
+  }
+
+  std::string_view message(
+      reinterpret_cast<char const*>(utf8_message.data()),
+      std::strlen(reinterpret_cast<char const*>(utf8_message.data())));
+  auto copied = CopyUtf8ToWireBuffer(
+      message, message_text, static_cast<std::size_t>(message_text_buffer_len));
+  if (!copied) {
+    LOG(ERROR) << "SQLGetDiagRecW:: " << copied.GetStatusRecord().message;
+    return SQL_ERROR;
+  }
+  // Per the ODBC spec this is the full length in characters, excluding the
+  // NUL terminator, even when the message was truncated.
+  if (message_text_len) {
+    *message_text_len = SaturateLength<SQLSMALLINT>(copied->total_units);
+  }
+  return copied->truncated ? SQL_SUCCESS_WITH_INFO : rc;
 }
 
 }  // namespace google::cloud::odbc_bq_driver

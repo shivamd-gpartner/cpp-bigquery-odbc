@@ -788,13 +788,17 @@ SQLRETURN SQLGetDataInternal(SQLHSTMT statement_handle,
   SQLLEN target_buff_len = (target_c_type == SQL_C_WCHAR)
                                ? (target_value_buffer_len / WireWcharSize())
                                : target_value_buffer_len;
+  // A SQL_C_WCHAR value also needs room for its NUL. For string data the UTF-8
+  // length is an upper bound on the length in wire code units.
+  bool const may_not_fit = (target_c_type == SQL_C_WCHAR)
+                               ? (ds_val.size() >= target_buff_len)
+                               : (ds_val.size() > target_buff_len);
   if (offset == 0) {
-    if ((ds_val.size() > target_buff_len) &&
-        (bq_data_type == BQDataType::kString ||
-         bq_data_type == BQDataType::kBytes ||
-         bq_data_type == BQDataType::kJson ||
-         bq_data_type == BQDataType::kStruct ||
-         bq_data_type == BQDataType::kArray)) {
+    if (may_not_fit && (bq_data_type == BQDataType::kString ||
+                        bq_data_type == BQDataType::kBytes ||
+                        bq_data_type == BQDataType::kJson ||
+                        bq_data_type == BQDataType::kStruct ||
+                        bq_data_type == BQDataType::kArray)) {
       result_set.translated_data.last_target_c_type = target_c_type;
 
       size_t buffer_size = 0;
@@ -849,27 +853,35 @@ SQLRETURN SQLGetDataInternal(SQLHSTMT statement_handle,
   }
 
   // Validating if data size is more then buffersize, SQLGetData will return
-  // partial Data
-  if (result_set.translated_data.data.size() - offset >=
-      target_value_buffer_len) {
+  // partial Data. For SQL_C_WCHAR the stored data is in wire code units and the
+  // chunk must leave room for a NUL terminator of the same width.
+  auto const remaining_bytes =
+      static_cast<SQLLEN>(result_set.translated_data.data.size()) - offset;
+  auto const wire_sz = static_cast<SQLLEN>(WireWcharSize());
+  bool const is_partial =
+      (target_c_type == SQL_C_WCHAR)
+          ? (remaining_bytes + wire_sz > target_value_buffer_len)
+          : (remaining_bytes >= target_value_buffer_len);
+  if (is_partial) {
     if (target_c_type == SQL_C_BINARY) {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   target_value_buffer_len);
       result_set.translated_data.row_offset = offset + target_value_buffer_len;
     } else if (target_c_type == SQL_C_WCHAR) {
-      auto data_size = result_set.translated_data.data.size();
-      auto max_buff_chars = target_value_buffer_len / WireWcharSize();
-      auto offset_chars = offset / WireWcharSize();
-      auto remain_chars =
-          (data_size > offset_chars) ? (data_size - offset_chars) : 0;
-      auto copy_chars = (remain_chars >= max_buff_chars) ? (max_buff_chars - 1)
-                                                         : remain_chars;
-
-      std::memcpy(target_value, result_set.translated_data.data.data() + offset,
-                  copy_chars * WireWcharSize());
-      reinterpret_cast<SQLWCHAR*>(target_value)[copy_chars] = 0;
-      result_set.translated_data.row_offset =
-          offset + (copy_chars * WireWcharSize());
+      // Copies whole code units only. A chunk may end inside a multi-unit
+      // character; the application reassembles the chunks.
+      SQLLEN const capacity_units = target_value_buffer_len / wire_sz;
+      SQLLEN const copy_units =
+          capacity_units > 0
+              ? std::min(remaining_bytes / wire_sz, capacity_units - 1)
+              : 0;
+      auto* dest = static_cast<char*>(target_value);
+      std::memcpy(dest, result_set.translated_data.data.data() + offset,
+                  copy_units * wire_sz);
+      if (capacity_units > 0) {
+        std::memset(dest + copy_units * wire_sz, 0, wire_sz);
+      }
+      result_set.translated_data.row_offset = offset + copy_units * wire_sz;
     } else {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   target_value_buffer_len - 1);
@@ -885,10 +897,18 @@ SQLRETURN SQLGetDataInternal(SQLHSTMT statement_handle,
     }
     return LogAndReturnCode(stmt_handle, status_record);
   }
-  if (offset != 0) {
+  // With offset == 0 the data was translated above because the source looked
+  // too long; for SQL_C_WCHAR its wire form can still fit, so copy it here.
+  if (offset != 0 || target_c_type == SQL_C_WCHAR) {
     if (target_c_type == SQL_C_BINARY) {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   result_set.translated_data.data.size() - offset);
+    } else if (target_c_type == SQL_C_WCHAR) {
+      // is_partial is false, so the rest of the data and its NUL fit.
+      auto* dest = static_cast<char*>(target_value);
+      std::memcpy(dest, result_set.translated_data.data.data() + offset,
+                  remaining_bytes);
+      std::memset(dest + remaining_bytes, 0, wire_sz);
     } else {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   result_set.translated_data.data.size() - offset + 1);

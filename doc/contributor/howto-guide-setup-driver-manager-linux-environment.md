@@ -107,6 +107,52 @@ cd $CPP_BIGQUERY_ODBC_REPO_PATH
 sudo cp build-out/home/google/cloud/odbc/libgoogle_cloud_odbc_bq_driver.so /opt/simba/googlebigqueryodbc/lib/libgoogle_cloud_odbc_bq_driver.so
 ```
 
+## Configuring the SQLWCHAR encoding (`WcharEncoding`)
+
+On Linux and macOS the size of `SQLWCHAR` depends on the Driver Manager:
+unixODBC uses 2-byte UTF-16 code units, iODBC uses 4-byte UTF-32 code units.
+The driver does not negotiate this with the Driver Manager. The Unicode (W)
+APIs read and write wide-character buffers in the encoding selected by
+`WcharEncoding` in the `[Driver]` section of `googlebigqueryodbc.ini`, and
+interpret every wide-character buffer length in units of that encoding.
+
+| Driver Manager                             | Setting                                       |
+| ------------------------------------------ | --------------------------------------------- |
+| unixODBC                                   | `WcharEncoding=UTF-16LE`                      |
+| unixODBC built with `SQL_WCHART_CONVERT`   | `WcharEncoding=UTF-32LE`                      |
+| iODBC                                      | `WcharEncoding=` (empty, default) or `UTF-32LE` |
+
+To check how a unixODBC build was configured, run `odbc_config --cflags` and
+look for `-DSQL_WCHART_CONVERT`.
+
+- Accepted values, case-insensitive: `UTF-8`/`UTF8`,
+  `UTF-16`/`UTF-16LE`/`UTF16LE`, `UTF-32`/`UTF-32LE`/`UTF32LE`/`UCS-4LE`, and
+  empty or `default`.
+- Empty or `default` uses `sizeof(SQLWCHAR)` from the headers the driver was
+  built with. The release builds use iODBC headers, so the default is UTF-32LE
+  (4 bytes), as it is on macOS.
+- `DriverManagerEncoding`, the Simba driver's name for this setting, is accepted
+  with the same values, so ini files migrated from Simba keep working. If both
+  keys are set, `WcharEncoding` wins and a warning is logged.
+- An unrecognized value is logged as an error and the default is used.
+- The effective encoding is logged at INFO level when logging is enabled.
+- The setting is ignored on Windows, where `SQLWCHAR` is always UTF-16LE.
+
+A setting that does not match the Driver Manager garbles wide-character text.
+When the configured code unit is wider than the Driver Manager's `SQLWCHAR`
+(for example the default with unixODBC), the 6-character `SQLSTATE` buffer
+that unixODBC passes to `SQLGetDiagRecW` is also overrun. Always set
+`WcharEncoding=UTF-16LE` when using unixODBC.
+
+### Build against the headers of the Driver Manager you run with
+
+`sizeof(SQLWCHAR)` is fixed when the driver and the integration test binaries
+are compiled. Compile both against the headers of the Driver Manager that they
+link and load at runtime: point `ODBC_INCLUDE_PATH` at the unixODBC headers when
+linking with `-lodbc`, and at the iODBC headers when linking with `-liodbc`.
+Mixing them (for example iODBC headers with a unixODBC runtime) makes the tests
+pass buffers sized for one `SQLWCHAR` to a Driver Manager that uses the other.
+
 ## Running the BQ Driver integration tests for Unicode APIs
 
 As per the ODBC spec, Driver Manager will consider the ODBC Driver as a unicode

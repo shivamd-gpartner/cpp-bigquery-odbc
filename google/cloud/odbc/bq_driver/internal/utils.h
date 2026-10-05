@@ -42,6 +42,7 @@ extern HINSTANCE g_hDllInstance;
 #include <locale>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -233,7 +234,6 @@ odbc_internal::StatusRecordOr<std::wstring> Utf8ToUtf16(
 odbc_internal::StatusRecordOr<std::string> BqConvertSQLWCHARToString(
     SQLWCHAR const* in_str, SQLINTEGER in_str_len);
 
-// Returns true when WcharEncoding=UTF-16LE is set in
 // Supported wire encodings for SQLWCHAR buffers across the ODBC driver
 // boundary.
 enum class WireEncoding {
@@ -245,17 +245,44 @@ enum class WireEncoding {
   kUtf32Le   // 4 bytes per character (UTF-32LE, e.g. iODBC native)
 };
 
-// Returns the effective wire encoding in use at runtime.
+// Keys in the [Driver] section of googlebigqueryodbc.ini that select the wire
+// encoding. DriverManagerEncoding is the Simba driver's name for the same
+// setting and is accepted so that migrated ini files keep working.
+inline constexpr char kWcharEncodingKey[] = "WcharEncoding";
+inline constexpr char kDriverManagerEncodingKey[] = "DriverManagerEncoding";
+
+// Returns the effective wire encoding in use at runtime. Never kDefault.
 WireEncoding GetEffectiveWireEncoding();
 
-// Apply the WcharEncoding value read from googlebigqueryodbc.ini. Accepted
-// values:
-//   "UTF-8"     1-byte UTF-8 wire format
-//   "UTF-16LE"  2-byte UTF-16LE wire format
-//   "UTF-32LE"  4-byte UTF-32LE wire format
-//   "" / "default" default: based on sizeof(SQLWCHAR)
-// No-op on Windows.
-void SetWcharEncodingFromConfig(std::string const& value);
+// Sets the process-wide wire encoding. kDefault restores the build default
+// (sizeof(SQLWCHAR)). No-op on Windows, where SQLWCHAR is always UTF-16LE.
+void SetWireEncoding(WireEncoding encoding);
+
+// Returns the canonical name of `encoding`, e.g. "UTF-16LE".
+std::string WireEncodingName(WireEncoding encoding);
+
+// Parses a WcharEncoding / DriverManagerEncoding value. Matching ignores case
+// and surrounding whitespace. Accepted values:
+//   "UTF-8", "UTF8"                                  -> kUtf8
+//   "UTF-16", "UTF-16LE", "UTF16LE"                  -> kUtf16Le
+//   "UTF-32", "UTF-32LE", "UTF32LE", "UCS-4LE"       -> kUtf32Le
+//   "", "default"                                    -> kDefault
+// Returns std::nullopt for any other value.
+std::optional<WireEncoding> ParseWireEncoding(std::string_view value);
+
+// The wire encoding selected by the [Driver] section of googlebigqueryodbc.ini,
+// plus the messages to log about how it was chosen.
+struct WcharEncodingConfig {
+  WireEncoding encoding = WireEncoding::kDefault;
+  std::vector<std::string> warnings;
+  std::vector<std::string> errors;
+};
+
+// Resolves the wire encoding from the [Driver] section. WcharEncoding is used
+// when present, otherwise DriverManagerEncoding. When both are present
+// WcharEncoding wins and a warning is recorded. An unrecognized value records
+// an error and falls back to the default.
+WcharEncodingConfig ResolveWcharEncoding(Section const& driver_section);
 
 // Bytes per character on the wire between this driver and its caller.
 // Returns 1 for UTF-8, 2 for UTF-16LE, 4 for UTF-32LE.

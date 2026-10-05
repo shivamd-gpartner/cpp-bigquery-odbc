@@ -18,9 +18,13 @@
 #include "google/cloud/odbc/bq_driver/internal/utils.h"
 #include "google/cloud/odbc/internal/diagnostic_records.h"
 #include "google/cloud/odbc/internal/sql_state_constants.h"
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -180,102 +184,65 @@ SQLRETURN IntValueToOutputBufferResponse(T val, SQLPOINTER buffer_ptr,
   return SQL_SUCCESS;
 }
 
-// Writes `count` wide characters from `src` directly into `dest` using the
-// current wire encoding. If `null_terminate` is true, writes a NUL terminator
-// at index `count`. `dest` must point to caller-owned storage of at least
-// `(count + (null_terminate ? 1 : 0)) * WireWcharSize()` bytes.
-inline void WriteWideToWireBuffer(std::wstring const& src, void* dest,
-                                  size_t count, bool null_terminate = false) {
-  if (count > src.size()) count = src.size();
+// Encodes `src` into the configured SQLWCHAR wire encoding (see
+// GetEffectiveWireEncoding()). `src` holds UTF-16 on Windows and UTF-32
+// elsewhere, as produced by Utf8ToUtf16(). The result is a whole number of
+// wire code units of WireWcharSize() bytes each, without a NUL terminator.
+// Code points that cannot be represented are replaced with U+FFFD.
+std::string EncodeWideToWire(std::wstring_view src);
 
-#if defined(_WIN32)
-  std::memcpy(dest, src.data(), count * sizeof(SQLWCHAR));
-  if (null_terminate) {
-    auto* d = static_cast<SQLWCHAR*>(dest);
-    d[count] = 0;
-  }
-#else
-  switch (GetEffectiveWireEncoding()) {
-    case WireEncoding::kUtf32Le:
-    case WireEncoding::kDefault: {
-      auto* d = static_cast<uint32_t*>(dest);
-      for (size_t i = 0; i < count; ++i) {
-        d[i] = static_cast<uint32_t>(
-            static_cast<std::make_unsigned_t<wchar_t> >(src[i]));
-      }
-      if (null_terminate) {
-        d[count] = 0;
-      }
-      return;
-    }
-    case WireEncoding::kUtf16Le: {
-      auto* d = static_cast<uint16_t*>(dest);
-      for (size_t i = 0; i < count; ++i) {
-        d[i] = static_cast<uint16_t>(
-            static_cast<std::make_unsigned_t<wchar_t> >(src[i]));
-      }
-      if (null_terminate) {
-        d[count] = 0;
-      }
-      return;
-    }
-    case WireEncoding::kUtf8: {
-      auto* d = static_cast<char*>(dest);
-      auto utf8_res = Utf16ToUtf8(src.substr(0, count));
-      std::string const& utf8_str = utf8_res.Ok() ? *utf8_res : std::string();
-      std::memcpy(dest, utf8_str.data(), utf8_str.size());
-      if (null_terminate) {
-        d[utf8_str.size()] = '\0';
-      }
-      return;
-    }
-  }
-#endif
+// The outcome of copying a string into a caller-owned SQLWCHAR buffer. All
+// counts are in wire code units and exclude the NUL terminator.
+struct WireCopyResult {
+  std::size_t total_units = 0;   // length of the whole string
+  std::size_t copied_units = 0;  // units written to the buffer
+  bool truncated = false;        // the buffer could not hold string + NUL
+};
+
+// Copies the wire-encoded string `encoded` (from EncodeWideToWire()) into
+// `dest`, a caller-owned buffer that holds `dest_units` wire code units.
+//
+// Never writes more than `dest_units * WireWcharSize()` bytes. When
+// `dest_units > 0` the output is always NUL-terminated inside the buffer, and
+// truncation never splits a UTF-16 surrogate pair or a UTF-8 sequence. When
+// `dest` is null or `dest_units` is 0 nothing is written; the result still
+// reports the full length, and `truncated` is set only for a non-null `dest`.
+WireCopyResult CopyWireUnitsToBuffer(std::string_view encoded, void* dest,
+                                     std::size_t dest_units);
+
+// Encodes `src` and copies it into `dest`; see CopyWireUnitsToBuffer().
+WireCopyResult CopyWideToWireBuffer(std::wstring_view src, void* dest,
+                                    std::size_t dest_units);
+
+// Converts UTF-8 `src` to the wire encoding and copies it into `dest`; see
+// CopyWireUnitsToBuffer(). Fails only if `src` is not valid UTF-8.
+odbc_internal::StatusRecordOr<WireCopyResult> CopyUtf8ToWireBuffer(
+    std::string_view src, void* dest, std::size_t dest_units);
+
+// Number of whole wire code units that fit in `byte_len` bytes, for the W
+// APIs whose buffer lengths are given in bytes. Negative lengths yield 0.
+std::size_t WireUnitsForBytes(SQLLEN byte_len);
+
+// Converts a length to the integer type of an ODBC length output argument,
+// saturating at the type's maximum.
+template <typename T>
+T SaturateLength(std::size_t len) {
+  return static_cast<T>(std::min<std::size_t>(
+      len, static_cast<std::size_t>(std::numeric_limits<T>::max())));
 }
 
-// Writes a single wire-format NUL terminator (one code unit, 2 or 4 bytes)
-// at byte offset `char_index * WireWcharSize()` from `dest`.
-inline void WriteWireNul(void* dest, size_t char_index) {
-  size_t const wire_sz = WireWcharSize();
-  std::memset(static_cast<uint8_t*>(dest) + (char_index * wire_sz), 0, wire_sz);
-}
-
-inline odbc_internal::StatusRecord WStrToOutputBufferResponse(
-    std::wstring const& wstr, SQLPOINTER dest_buf, SQLLEN buffer_length,
-    SQLINTEGER src_len, SQLINTEGER supp_max_len, SQLLEN* res_len) {
-  auto status_record = odbc_internal::StatusRecord::Ok();
-  size_t const wire_sz = WireWcharSize();
-
-  if (wstr.empty()) {
-    if (dest_buf && buffer_length > 0) {
-      WriteWireNul(dest_buf, 0);
-    }
-    if (res_len) {
-      *res_len = 0;
-    }
-    return status_record;
-  }
-
-  if (buffer_length > src_len) {
-    if (res_len) {
-      *res_len = src_len * static_cast<SQLLEN>(wire_sz);
-    }
-    WriteWideToWireBuffer(wstr, dest_buf, src_len, /*null_terminate=*/true);
-  } else if (supp_max_len <= buffer_length && buffer_length <= src_len) {
-    if (res_len) {
-      *res_len = buffer_length * static_cast<SQLLEN>(wire_sz);
-    }
-    WriteWideToWireBuffer(wstr, dest_buf, buffer_length - 1,
-                          /*null_terminate=*/true);
-    status_record = odbc_internal::StatusRecord{
-        google::cloud::odbc_internal::SQLStates::k_01004(), "Data truncated"};
-  } else {
-    status_record = odbc_internal::StatusRecord{
-        google::cloud::odbc_internal::SQLStates::k_22003(),
-        "Buffer length is insufficient"};
-  }
-  return status_record;
-}
+// Copies `wstr` into the SQL_C_WCHAR buffer `dest_buf`, which holds
+// `buffer_length` wire code units, and sets `*res_len` to a length in bytes:
+//  - If the string and its NUL fit, it is copied and `*res_len` is its length.
+//  - Else if `supp_max_len <= buffer_length`, the string is truncated to fit
+//    (NUL-terminated), `*res_len` is `buffer_length` units, and 01004 is
+//    returned.
+//  - Else nothing is written and 22003 is returned.
+odbc_internal::StatusRecord WStrToOutputBufferResponse(std::wstring const& wstr,
+                                                       SQLPOINTER dest_buf,
+                                                       SQLLEN buffer_length,
+                                                       SQLINTEGER supp_max_len,
+                                                       SQLLEN* res_len);
 
 SQLRETURN AddressToPointer(SQLPOINTER ptr, SQLPOINTER out_buf,
                            SQLINTEGER* str_len_ptr);
@@ -283,9 +250,12 @@ SQLRETURN AddressToPointer(SQLPOINTER ptr, SQLPOINTER out_buf,
 SQLRETURN AddressToPointer(SQLPOINTER ptr, SQLPOINTER out_buf,
                            SQLSMALLINT* str_len_ptr);
 
+// Like WStrToOutputBufferResponse(), for interval strings: truncation is
+// allowed (01004) only while all `whole_digits_count` whole digits still fit,
+// otherwise 22003 is returned and nothing is written.
 odbc_internal::StatusRecord WStrIntervalBufferResponse(
     std::wstring const& wstr, SQLPOINTER dest_buf, SQLLEN buffer_length,
-    SQLINTEGER char_len, SQLINTEGER whole_digits_count, SQLLEN* res_len);
+    SQLINTEGER whole_digits_count, SQLLEN* res_len);
 }  // namespace google::cloud::odbc_bq_driver_internal
 
 #endif  // CPP_BIGQUERY_ODBC_GOOGLE_CLOUD_ODBC_BQ_DRIVER_INTERNAL_ODBC_TYPE_UTILS_H
