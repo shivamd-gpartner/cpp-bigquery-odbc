@@ -18,9 +18,11 @@
 #include "google/cloud/odbc/bq_driver/internal/utils.h"
 #include "google/cloud/odbc/internal/diagnostic_records.h"
 #include "google/cloud/odbc/internal/sql_state_constants.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -240,6 +242,32 @@ inline void WriteWireNul(void* dest, size_t char_index) {
   std::memset(static_cast<uint8_t*>(dest) + (char_index * wire_sz), 0, wire_sz);
 }
 
+// Copies `src` into `dest`, a caller-owned buffer of `dest_units` wire code
+// units, in the current wire encoding. Writes at most `dest_units` code units
+// including the NUL terminator, and nothing when `dest` is null or
+// `dest_units` is 0. Returns true if `src` did not fit.
+inline bool CopyWideToWireBuffer(std::wstring const& src, void* dest,
+                                 size_t dest_units) {
+  if (dest == nullptr || dest_units == 0) return dest != nullptr;
+  size_t const wire_sz = WireWcharSize();
+  std::string encoded;
+#if !defined(_WIN32)
+  if (GetEffectiveWireEncoding() == WireEncoding::kUtf8) {
+    auto utf8 = Utf16ToUtf8(src);
+    if (utf8) encoded = *utf8;
+  } else
+#endif
+  {
+    encoded.resize(src.size() * wire_sz);
+    if (!src.empty()) WriteWideToWireBuffer(src, encoded.data(), src.size());
+  }
+  size_t const total = encoded.size() / wire_sz;
+  size_t const n = std::min(total, dest_units - 1);
+  std::memcpy(dest, encoded.data(), n * wire_sz);
+  std::memset(static_cast<char*>(dest) + n * wire_sz, 0, wire_sz);
+  return n < total;
+}
+
 inline odbc_internal::StatusRecord WStrToOutputBufferResponse(
     std::wstring const& wstr, SQLPOINTER dest_buf, SQLLEN buffer_length,
     SQLINTEGER src_len, SQLINTEGER supp_max_len, SQLLEN* res_len) {
@@ -260,13 +288,14 @@ inline odbc_internal::StatusRecord WStrToOutputBufferResponse(
     if (res_len) {
       *res_len = src_len * static_cast<SQLLEN>(wire_sz);
     }
-    WriteWideToWireBuffer(wstr, dest_buf, src_len, /*null_terminate=*/true);
+    CopyWideToWireBuffer(wstr, dest_buf, static_cast<size_t>(buffer_length));
   } else if (supp_max_len <= buffer_length && buffer_length <= src_len) {
     if (res_len) {
       *res_len = buffer_length * static_cast<SQLLEN>(wire_sz);
     }
-    WriteWideToWireBuffer(wstr, dest_buf, buffer_length - 1,
-                          /*null_terminate=*/true);
+    CopyWideToWireBuffer(
+        wstr, dest_buf,
+        buffer_length > 0 ? static_cast<size_t>(buffer_length) : 0);
     status_record = odbc_internal::StatusRecord{
         google::cloud::odbc_internal::SQLStates::k_01004(), "Data truncated"};
   } else {

@@ -51,15 +51,14 @@ odbc_internal::StatusRecord WStrIntervalBufferResponse(
     if (res_len) {
       *res_len = static_cast<SQLLEN>(char_len) * static_cast<SQLLEN>(wire_sz);
     }
-    WriteWideToWireBuffer(wstr, dest_buf, static_cast<size_t>(char_len),
-                          /*null_terminate=*/true);
+    CopyWideToWireBuffer(wstr, dest_buf, static_cast<size_t>(buffer_length));
   } else if (buffer_length > whole_digits_count) {
     if (res_len) {
       *res_len = buffer_length * static_cast<SQLLEN>(wire_sz);
     }
-    WriteWideToWireBuffer(wstr, dest_buf,
-                          static_cast<size_t>(buffer_length - 1),
-                          /*null_terminate=*/true);
+    CopyWideToWireBuffer(
+        wstr, dest_buf,
+        buffer_length > 0 ? static_cast<size_t>(buffer_length) : 0);
     status_record = odbc_internal::StatusRecord{
         google::cloud::odbc_internal::SQLStates::k_01004(), "Data truncated"};
   } else {

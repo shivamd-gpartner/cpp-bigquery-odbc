@@ -849,27 +849,31 @@ SQLRETURN SQLGetDataInternal(SQLHSTMT statement_handle,
   }
 
   // Validating if data size is more then buffersize, SQLGetData will return
-  // partial Data
-  if (result_set.translated_data.data.size() - offset >=
-      target_value_buffer_len) {
+  // partial Data. SQL_C_WCHAR data also needs room for a NUL of the wire width.
+  auto const remaining_bytes =
+      static_cast<SQLLEN>(result_set.translated_data.data.size()) - offset;
+  auto const wire_sz = static_cast<SQLLEN>(WireWcharSize());
+  if ((target_c_type == SQL_C_WCHAR)
+          ? (remaining_bytes + wire_sz > target_value_buffer_len)
+          : (remaining_bytes >= target_value_buffer_len)) {
     if (target_c_type == SQL_C_BINARY) {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   target_value_buffer_len);
       result_set.translated_data.row_offset = offset + target_value_buffer_len;
     } else if (target_c_type == SQL_C_WCHAR) {
-      auto data_size = result_set.translated_data.data.size();
-      auto max_buff_chars = target_value_buffer_len / WireWcharSize();
-      auto offset_chars = offset / WireWcharSize();
-      auto remain_chars =
-          (data_size > offset_chars) ? (data_size - offset_chars) : 0;
-      auto copy_chars = (remain_chars >= max_buff_chars) ? (max_buff_chars - 1)
-                                                         : remain_chars;
-
-      std::memcpy(target_value, result_set.translated_data.data.data() + offset,
-                  copy_chars * WireWcharSize());
-      reinterpret_cast<SQLWCHAR*>(target_value)[copy_chars] = 0;
-      result_set.translated_data.row_offset =
-          offset + (copy_chars * WireWcharSize());
+      // Whole wire code units plus a NUL of the same width, inside the buffer.
+      SQLLEN const max_buff_chars = target_value_buffer_len / wire_sz;
+      SQLLEN const copy_chars =
+          max_buff_chars > 0
+              ? std::min(remaining_bytes / wire_sz, max_buff_chars - 1)
+              : 0;
+      auto* dest = static_cast<char*>(target_value);
+      std::memcpy(dest, result_set.translated_data.data.data() + offset,
+                  copy_chars * wire_sz);
+      if (max_buff_chars > 0) {
+        std::memset(dest + copy_chars * wire_sz, 0, wire_sz);
+      }
+      result_set.translated_data.row_offset = offset + copy_chars * wire_sz;
     } else {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   target_value_buffer_len - 1);
@@ -889,6 +893,11 @@ SQLRETURN SQLGetDataInternal(SQLHSTMT statement_handle,
     if (target_c_type == SQL_C_BINARY) {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   result_set.translated_data.data.size() - offset);
+    } else if (target_c_type == SQL_C_WCHAR) {
+      auto* dest = static_cast<char*>(target_value);
+      std::memcpy(dest, result_set.translated_data.data.data() + offset,
+                  remaining_bytes);
+      std::memset(dest + remaining_bytes, 0, wire_sz);
     } else {
       std::memcpy(target_value, result_set.translated_data.data.data() + offset,
                   result_set.translated_data.data.size() - offset + 1);

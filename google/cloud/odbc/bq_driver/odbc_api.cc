@@ -57,6 +57,7 @@ using google::cloud::odbc_bq_driver_internal::BqConvertSQLWCHARToString;
 using google::cloud::odbc_bq_driver_internal::ConnectionAttr;
 using google::cloud::odbc_bq_driver_internal::ConnectionHandle;
 using google::cloud::odbc_bq_driver_internal::ConnectionValueType;
+using google::cloud::odbc_bq_driver_internal::CopyWideToWireBuffer;
 using google::cloud::odbc_bq_driver_internal::DescriptorHandle;
 using google::cloud::odbc_bq_driver_internal::IsDiagIdentifierString;
 using google::cloud::odbc_bq_driver_internal::IsFieldIdentifierString;
@@ -78,6 +79,36 @@ using google::cloud::odbc_bq_driver::ToCharStr;
 using google::cloud::odbc_bq_driver::ToSqlChar;
 
 constexpr int kBufferLength = 4096;
+
+// Clamps a caller's buffer length to the size of the local kBufferLength
+// buffer an internal function writes into. Negative lengths are passed on so
+// that the internal function reports them.
+template <typename T>
+T LocalBufferLen(T caller_len) {
+  return caller_len > kBufferLength ? static_cast<T>(kBufferLength)
+                                    : caller_len;
+}
+
+// Number of whole wire code units in a buffer of `len` bytes.
+size_t WireUnits(SQLLEN len) {
+  return len > 0 ? static_cast<size_t>(len) / WireWcharSize() : 0;
+}
+
+// Number of wire code units in a character-count buffer length.
+size_t CharUnits(SQLLEN len) { return len > 0 ? static_cast<size_t>(len) : 0; }
+
+// Length of a NUL-terminated SQLWCHAR string in wire code units.
+size_t WireStrLen(SQLWCHAR const* str) {
+  if (str == nullptr) return 0;
+  auto const* bytes = reinterpret_cast<unsigned char const*>(str);
+  size_t const wire_sz = WireWcharSize();
+  size_t len = 0;
+  while (std::any_of(bytes + len * wire_sz, bytes + (len + 1) * wire_sz,
+                     [](unsigned char b) { return b != 0; })) {
+    ++len;
+  }
+  return len;
+}
 
 // Internal Helper Functions
 namespace {
@@ -293,8 +324,8 @@ SQLRETURN SQL_API SQLDriverConnectW(
       return utf16_out_conn_str.GetCalculatedReturnCode();
     }
 
-    WriteWideToWireBuffer(*utf16_out_conn_str, outConnectionString,
-                          out_conn_str_len);
+    CopyWideToWireBuffer(*utf16_out_conn_str, outConnectionString,
+                         CharUnits(outConnectionStringBufferLen));
   }
   if (outConnectionStringLen) *outConnectionStringLen = out_conn_str_len;
 
@@ -389,22 +420,14 @@ SQLRETURN SQL_API SQLBrowseConnectW(SQLHDBC connectionHandle,
       outConnectionStringLen);
 
   // Handle Unicode conversion of output parameters.
-  if (SQL_SUCCEEDED(rc) || rc == SQL_NEED_DATA) {
+  if ((SQL_SUCCEEDED(rc) || rc == SQL_NEED_DATA) && outConnectionString) {
     StatusRecordOr<std::wstring> utf16_out_conn_str =
         Utf8ToUtf16((char*)out_connection_string);
     if (!utf16_out_conn_str) {
       return utf16_out_conn_str.GetCalculatedReturnCode();
     }
-    {
-      size_t const dest_chars =
-          static_cast<size_t>(outConnectionStringBufferLen);
-      size_t const to_copy =
-          std::min<size_t>(utf16_out_conn_str->size(), dest_chars);
-      // memset zeros the entire dest, which leaves the trailing wire NUL in
-      // place after we write `to_copy` chars.
-      std::memset(outConnectionString, '\0', dest_chars * WireWcharSize());
-      WriteWideToWireBuffer(*utf16_out_conn_str, outConnectionString, to_copy);
-    }
+    CopyWideToWireBuffer(*utf16_out_conn_str, outConnectionString,
+                         CharUnits(outConnectionStringBufferLen));
   }
 
   return rc;
@@ -470,8 +493,7 @@ SQLRETURN SQL_API SQLConnectW(SQLHDBC connectionHandle, SQLWCHAR* serverName,
   // to be non-empty hence we need to validate it before proceeding further.
   size_t w_server_name_len = 0;
   if (serverName) {
-    std::wstring w_server_str(reinterpret_cast<wchar_t const*>(serverName));
-    w_server_name_len = w_server_str.length();
+    w_server_name_len = WireStrLen(serverName);
     if (w_server_name_len == 0) {
       auto status =
           StatusRecord{SQLStates::k_HY000(),
@@ -498,8 +520,7 @@ SQLRETURN SQL_API SQLConnectW(SQLHDBC connectionHandle, SQLWCHAR* serverName,
   size_t w_user_name_len = 0;
   StatusRecordOr<std::string> utf8_user_name;
   if (userName) {
-    std::wstring w_user_name_str(reinterpret_cast<wchar_t const*>(userName));
-    w_user_name_len = w_user_name_str.length();
+    w_user_name_len = WireStrLen(userName);
   }
   if (w_user_name_len > 0) {
     utf8_user_name = BqConvertSQLWCHARToString(userName, w_user_name_len);
@@ -513,8 +534,7 @@ SQLRETURN SQL_API SQLConnectW(SQLHDBC connectionHandle, SQLWCHAR* serverName,
   size_t w_auth_str_len = 0;
   StatusRecordOr<std::string> utf8_auth_str;
   if (authString) {
-    std::wstring w_auth_str(reinterpret_cast<wchar_t const*>(authString));
-    w_auth_str_len = w_auth_str.length();
+    w_auth_str_len = WireStrLen(authString);
   }
   if (w_auth_str_len > 0) {
     utf8_auth_str = BqConvertSQLWCHARToString(authString, w_auth_str_len);
@@ -542,33 +562,6 @@ SQLRETURN SQL_API SQLConnectW(SQLHDBC connectionHandle, SQLWCHAR* serverName,
     rc = google::cloud::odbc_bq_driver::SQLConnectInternal(
         connectionHandle, ToSqlChar(utf8_server_name->data()), serverNameLen,
         ToSqlChar(""), w_user_name_len, ToSqlChar(""), w_auth_str_len);
-  }
-
-  // Handle Unicode conversion of output parameters.
-  StatusRecordOr<std::wstring> utf16_server_name =
-      Utf8ToUtf16(*utf8_server_name);
-  if (!utf16_server_name) {
-    return utf16_server_name.GetCalculatedReturnCode();
-  }
-  serverNameLen = utf16_server_name->length();
-  WriteWideToWireBuffer(*utf16_server_name, serverName, serverNameLen);
-
-  if (w_user_name_len > 0) {
-    StatusRecordOr<std::wstring> utf16_user_name = Utf8ToUtf16(*utf8_user_name);
-    if (!utf16_user_name) {
-      return utf16_user_name.GetCalculatedReturnCode();
-    }
-    userNameLen = utf16_user_name->length();
-    WriteWideToWireBuffer(*utf16_user_name, userName, userNameLen);
-  }
-
-  if (w_auth_str_len > 0) {
-    StatusRecordOr<std::wstring> utf16_auth_str = Utf8ToUtf16(*utf8_auth_str);
-    if (!utf16_auth_str) {
-      return utf16_auth_str.GetCalculatedReturnCode();
-    }
-    authStringLen = utf16_auth_str->length();
-    WriteWideToWireBuffer(*utf16_auth_str, authString, authStringLen);
   }
 
   return rc;
@@ -636,11 +629,11 @@ SQLRETURN SQL_API SQLGetInfoW(SQLHDBC connectionHandle, SQLUSMALLINT infoType,
   // Call to internal common function for SQLGetInfo and SQLGetInfoW
   // in odbc_driver_metadata.h.
   rc = ::google::cloud::odbc_bq_driver::SQLGetInfoInternal(
-      connectionHandle, infoType, info_val_buffer, infoValueBufferLen,
-      &info_val_buffer_len);
+      connectionHandle, infoType, info_val_buffer,
+      LocalBufferLen(infoValueBufferLen), &info_val_buffer_len);
 
   // Handle Unicode conversion of output parameters.
-  if (SQL_SUCCEEDED(rc)) {
+  if (SQL_SUCCEEDED(rc) && infoValue) {
     if (IsInfoTypeString(infoType)) {
       std::memset(infoValue, '\0', infoValueBufferLen);
 
@@ -651,18 +644,13 @@ SQLRETURN SQL_API SQLGetInfoW(SQLHDBC connectionHandle, SQLUSMALLINT infoType,
           return utf16_info_val.GetCalculatedReturnCode();
         }
 
-        size_t const wire_sz = WireWcharSize();
-        size_t const dest_chars =
-            static_cast<size_t>(infoValueBufferLen) / wire_sz;
-        size_t const to_copy =
-            std::min<size_t>(utf16_info_val->size(), dest_chars);
-        bool const can_null_terminate = to_copy < dest_chars;
-        WriteWideToWireBuffer(*utf16_info_val, infoValue, to_copy,
-                              can_null_terminate);
+        CopyWideToWireBuffer(*utf16_info_val, infoValue,
+                             WireUnits(infoValueBufferLen));
       }
     } else {
       if (info_val_buffer_len > 0) {
-        std::memcpy(infoValue, info_val_buffer, info_val_buffer_len);
+        std::memcpy(infoValue, info_val_buffer,
+                    std::min<SQLSMALLINT>(info_val_buffer_len, kBufferLength));
       } else {
         std::memset(infoValue, '\0', infoValueBufferLen);
       }
@@ -927,15 +915,12 @@ SQLRETURN SQL_API SQLGetConnectAttrW(SQLHDBC connectionHandle,
     }
     {
       size_t const wire_sz = WireWcharSize();
-      size_t const dest_chars = static_cast<size_t>(valueBufferLen) / wire_sz;
-      size_t const to_copy =
-          std::min<size_t>(updated_out_attr_status->size(), dest_chars);
       if (valueStringLen) {
         *valueStringLen =
             static_cast<SQLLEN>(updated_out_attr_status->size() * wire_sz);
       }
-      std::memset(value, '\0', valueBufferLen);
-      WriteWideToWireBuffer(*updated_out_attr_status, value, to_copy);
+      CopyWideToWireBuffer(*updated_out_attr_status, value,
+                           WireUnits(valueBufferLen));
     }
   }
 
@@ -1158,7 +1143,7 @@ SQLRETURN SQL_API SQLGetDescFieldW(SQLHDESC descriptorHandle,
   // in odbc_descriptor.h.
   rc = google::cloud::odbc_bq_driver::SQLGetDescFieldInternal(
       descriptorHandle, recNumber, fieldId, (SQLPOINTER)out_desc_val,
-      outDescValueBufferLen, &out_desc_val_string_len);
+      LocalBufferLen(outDescValueBufferLen), &out_desc_val_string_len);
 
   // Handle Unicode conversion of output parameters.
   if (SQL_SUCCEEDED(rc) && out_desc_val_string_len > 0) {
@@ -1170,18 +1155,14 @@ SQLRETURN SQL_API SQLGetDescFieldW(SQLHDESC descriptorHandle,
       }
       {
         size_t const wire_sz = WireWcharSize();
-        size_t const dest_chars =
-            static_cast<size_t>(outDescValueBufferLen) / wire_sz;
-        size_t const to_copy =
-            std::min<size_t>(utf16_out_desc_val->size(), dest_chars);
         out_desc_val_string_len =
             static_cast<SQLINTEGER>(utf16_out_desc_val->size() * wire_sz);
-        std::memset(outDescValue, '\0', outDescValueBufferLen);
-        WriteWideToWireBuffer(*utf16_out_desc_val, outDescValue, to_copy);
+        CopyWideToWireBuffer(*utf16_out_desc_val, outDescValue,
+                             WireUnits(outDescValueBufferLen));
       }
     } else {
       std::memcpy(outDescValue, (SQLPOINTER)out_desc_val,
-                  out_desc_val_string_len);
+                  std::min<SQLINTEGER>(out_desc_val_string_len, kBufferLength));
     }
   }
   if (outDescValueStringLen) *outDescValueStringLen = out_desc_val_string_len;
@@ -1250,8 +1231,9 @@ SQLRETURN SQL_API SQLGetDescRecW(
   // Call to common internal function for SQLGetDescRec and SQLGetDescRecW
   // in odbc_descriptor.h.
   rc = google::cloud::odbc_bq_driver::SQLGetDescRecInternal(
-      descriptorHandle, recNumber, name_buffer, nameBufferLen, &name_string_len,
-      descType, descSubType, descOctetLen, descPrecision, descScale, nullable);
+      descriptorHandle, recNumber, name_buffer, LocalBufferLen(nameBufferLen),
+      &name_string_len, descType, descSubType, descOctetLen, descPrecision,
+      descScale, nullable);
 
   // Handle Unicode conversion of output parameters.
   if (SQL_SUCCEEDED(rc) && name_string_len > 0) {
@@ -1259,10 +1241,7 @@ SQLRETURN SQL_API SQLGetDescRecW(
     if (!utf16_name) {
       return utf16_name.GetCalculatedReturnCode();
     }
-    size_t const dest_chars = static_cast<size_t>(nameBufferLen);
-    size_t const to_copy = std::min<size_t>(utf16_name->size(), dest_chars);
-    std::memset(name, '\0', dest_chars * WireWcharSize());
-    WriteWideToWireBuffer(*utf16_name, name, to_copy);
+    CopyWideToWireBuffer(*utf16_name, name, CharUnits(nameBufferLen));
   }
   if (nameStringLen) *nameStringLen = name_string_len;
 
@@ -1539,7 +1518,8 @@ SQLRETURN SQL_API SQLGetCursorNameW(SQLHSTMT statementHandle,
   // Call to common internal function for SQLGetCursorName and SQLGetCursorNameW
   // in odbc_sql_requests.h.
   rc = ::google::cloud::odbc_bq_driver::SQLGetCursorNameInternal(
-      statementHandle, cursor_name, cursorNameBufferLen, &cursor_name_len);
+      statementHandle, cursor_name, LocalBufferLen(cursorNameBufferLen),
+      &cursor_name_len);
 
   // Handle Unicode conversion of output parameters.
   if (SQL_SUCCEEDED(rc) && cursor_name_len > 0) {
@@ -1548,8 +1528,8 @@ SQLRETURN SQL_API SQLGetCursorNameW(SQLHSTMT statementHandle,
     if (!utf16_cur_name) {
       return utf16_cur_name.GetCalculatedReturnCode();
     }
-    WriteWideToWireBuffer(*utf16_cur_name, cursorName, utf16_cur_name->size(),
-                          /*null_terminate=*/true);
+    CopyWideToWireBuffer(*utf16_cur_name, cursorName,
+                         CharUnits(cursorNameBufferLen));
   }
   if (cursorNameStringLen) *cursorNameStringLen = cursor_name_len;
 
@@ -1779,7 +1759,6 @@ SQLRETURN SQL_API SQLNativeSqlW(SQLHDBC connectionHandle,
                                 SQLINTEGER* outStatementTextLen) {
   SQLRETURN rc = SQL_SUCCESS;
   SQLRETURN status;
-  SQLCHAR out_statement_text[kBufferLength] = {0};
   InitializeTracing("SQLNativeSqlW");
 
   HandleLock lock(connectionHandle, SQL_HANDLE_DBC);
@@ -1807,11 +1786,17 @@ SQLRETURN SQL_API SQLNativeSqlW(SQLHDBC connectionHandle,
   // TODO: Internal call should be made with out_statement_text as the output
   // parameter.
   // Handle Unicode conversion of output parameters.
+  // The output equals the input statement, so size the local buffer for it.
+  std::vector<SQLCHAR> out_statement_text(
+      (utf8_in_stmt_txt ? utf8_in_stmt_txt->size() : 0) + 1, 0);
   rc = ::google::cloud::odbc_bq_driver::SQLNativeSqlInternal(
       connectionHandle, sqlchar_in_stmt_txt, inStatementTextLen,
-      out_statement_text, outStatementTextBufferLen, outStatementTextLen);
+      out_statement_text.data(),
+      std::min<SQLINTEGER>(outStatementTextBufferLen,
+                           static_cast<SQLINTEGER>(out_statement_text.size())),
+      outStatementTextLen);
 
-  std::string outStatementTextStr = (char*)out_statement_text;
+  std::string outStatementTextStr = (char*)out_statement_text.data();
   if (!outStatementTextStr.empty()) {
     StatusRecordOr<std::wstring> utf16_out_stmt_txt =
         Utf8ToUtf16(outStatementTextStr);
@@ -2102,14 +2087,16 @@ SQLRETURN SQL_API SQLColAttributeW(SQLHSTMT statementHandle,
   updated_character_attrib_val = (SQLPOINTER)character_attrib_val;
   // reset characterAttribute buffer to make sure it doesn't contain garbage or
   // cache value.
-  std::memset(characterAttribute, '\0', characterAttributeBufferLen);
+  if (characterAttribute && characterAttributeBufferLen > 0) {
+    std::memset(characterAttribute, '\0', characterAttributeBufferLen);
+  }
 
   // Handle Unicode conversion of input parameters.
   // Call to common internal function for SQLColAttribute and SQLColAttributeW
   // in odbc_sql_results.h.
   rc = ::google::cloud::odbc_bq_driver::SQLColAttributeInternal(
       statementHandle, columnNumber, fieldIdentifier,
-      updated_character_attrib_val, characterAttributeBufferLen,
+      updated_character_attrib_val, LocalBufferLen(characterAttributeBufferLen),
       &character_attribute_string_len, numericAttribute);
 
   // Handle Unicode conversion of output parameters.
@@ -2132,9 +2119,9 @@ SQLRETURN SQL_API SQLColAttributeW(SQLHSTMT statementHandle,
                             can_null_terminate);
       character_attribute_string_len = static_cast<SQLSMALLINT>(wstr.size());
 
-    } else {
+    } else if (characterAttribute && characterAttributeBufferLen > 0) {
       std::memcpy(characterAttribute, (SQLPOINTER)updated_character_attrib_val,
-                  characterAttributeBufferLen);
+                  LocalBufferLen(characterAttributeBufferLen));
     }
   }
   if (characterAttributeStringLen) {
@@ -2296,9 +2283,9 @@ SQLRETURN SQL_API SQLDescribeColW(
   // Call to common internal function for SQLDescribeCol and SQLDescribeColW
   // in odbc_sql_results.h.
   rc = ::google::cloud::odbc_bq_driver::SQLDescribeColInternal(
-      statementHandle, columnNumber, column_name_buffer, columnNameBufferLen,
-      &column_name_string_len, columnSQLdataType, columnSize, decimalDigits,
-      columnNullable);
+      statementHandle, columnNumber, column_name_buffer,
+      LocalBufferLen(columnNameBufferLen), &column_name_string_len,
+      columnSQLdataType, columnSize, decimalDigits, columnNullable);
 
   // Handle Unicode conversion of output parameters.
   if (SQL_SUCCEEDED(rc) && column_name_string_len > 0) {
@@ -2309,11 +2296,8 @@ SQLRETURN SQL_API SQLDescribeColW(
     }
     {
       // columnNameBufferLen is in SQLWCHAR characters per ODBC spec.
-      size_t const dest_chars = static_cast<size_t>(columnNameBufferLen);
-      size_t const to_copy =
-          std::min<size_t>(utf16_col_name->size(), dest_chars);
-      std::memset(columnName, '\0', dest_chars * WireWcharSize());
-      WriteWideToWireBuffer(*utf16_col_name, columnName, to_copy);
+      CopyWideToWireBuffer(*utf16_col_name, columnName,
+                           CharUnits(columnNameBufferLen));
     }
   }
 
@@ -2512,7 +2496,6 @@ SQLRETURN SQL_API SQLGetDiagFieldW(SQLSMALLINT handleType, SQLHANDLE handle,
 
   // Handle Unicode conversion of output parameters.
   if (SQL_SUCCEEDED(rc) && diag_info_str_len > 0) {
-    std::memset(diagInfo, '\0', diagInfoBufferLen);
     if (IsDiagIdentifierString(diagIdentifier)) {
       updated_out_diag_info_status =
           ConvertSQLPointerToSQLWChar(updated_diag_info, diagInfoBufferLen);
@@ -2521,17 +2504,11 @@ SQLRETURN SQL_API SQLGetDiagFieldW(SQLSMALLINT handleType, SQLHANDLE handle,
       }
       {
         size_t const wire_sz = WireWcharSize();
-        size_t const dest_chars =
-            static_cast<size_t>(diagInfoBufferLen) / wire_sz;
-        size_t const to_copy =
-            std::min<size_t>(updated_out_diag_info_status->size(), dest_chars);
         diag_info_str_len =
             static_cast<SQLLEN>(updated_out_diag_info_status->size() * wire_sz);
-        WriteWideToWireBuffer(*updated_out_diag_info_status, diagInfo, to_copy);
+        CopyWideToWireBuffer(*updated_out_diag_info_status, diagInfo,
+                             WireUnits(diagInfoBufferLen));
       }
-
-    } else {
-      std::memcpy(diagInfo, updated_diag_info, diagInfoBufferLen);
     }
   }
   if (diagInfoStringLen) *diagInfoStringLen = diag_info_str_len;
@@ -2626,11 +2603,8 @@ SQLRETURN SQL_API SQLGetDiagRecW(SQLSMALLINT handleType, SQLHANDLE handle,
     }
     {
       // messageTextBufferLen is in SQLWCHAR characters per ODBC spec.
-      size_t const dest_chars = static_cast<size_t>(messageTextBufferLen);
-      size_t const to_copy =
-          std::min<size_t>(utf16_msg_txt->size(), dest_chars);
-      std::memset(messageText, '\0', dest_chars * WireWcharSize());
-      WriteWideToWireBuffer(*utf16_msg_txt, messageText, to_copy);
+      CopyWideToWireBuffer(*utf16_msg_txt, messageText,
+                           CharUnits(messageTextBufferLen));
     }
   }
   if (messageTextLen) *messageTextLen = message_text_buffer_len;
